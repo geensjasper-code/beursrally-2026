@@ -236,9 +236,9 @@ Inpost,LU2290522684,EUR,stale,INPST.AS
 Intel,US4581401001,USD,stock,INTC
 IBM,US4592001014,USD,stock,IBM
 Intuitive Surgical,US46120E6023,USD,stock,ISRG
-Invesco Nasdaq Biotech ETF,IE00BQ70R696,EUR,etf,
+Invesco Nasdaq Biotech ETF,IE00BQ70R696,EUR,uitgesloten,
 Invesco Pan European High Income,LU0243957239,EUR,fund,
-Invesco Physical Gold ETC,IE00B579F325,EUR,etf,
+Invesco Physical Gold ETC,IE00B579F325,EUR,uitgesloten,
 Ion Beam Applications,BE0003766806,EUR,stock,IBAB.BR
 IonQ,US46222L1089,USD,stock,IONQ
 iShares AEX ETF,IE00B0M62Y33,EUR,etf,IAEX.AS
@@ -438,9 +438,9 @@ Warehouses Estates Belgium,BE0003734481,EUR,stock,WEB.BR
 Wendel,FR0000121204,EUR,stock,MF.PA
 Wereldhave Belgium,BE0003724383,EUR,stock,WEHB.BR
 Wereldhave,NL0000289213,EUR,stock,WHA.AS
-WisdomTree AI ETF,IE00BDVPNG13,EUR,etf,
-WisdomTree Brent Crude ETC,JE00B78CGV99,EUR,etf,
-WisdomTree Cybersecurity ETF,IE00BLPK3577,EUR,etf,
+WisdomTree AI ETF,IE00BDVPNG13,EUR,uitgesloten,
+WisdomTree Brent Crude ETC,JE00B78CGV99,EUR,uitgesloten,
+WisdomTree Cybersecurity ETF,IE00BLPK3577,EUR,uitgesloten,
 Wolters Kluwer,NL0000395903,EUR,stock,WKL.AS
 X Fab Silicon Foundries,BE0974310428,EUR,stock,XFAB.PA
 Xior Student Housing,BE0974288202,EUR,stock,XIOR.BR
