@@ -55,6 +55,8 @@ MARKET = {
     "^VIX": "vix",
     "^VXN": "vxn",
     "BTC-USD": "bitcoin",
+    "^IRX": "us_rate_3m",
+    "^TNX": "us_rate_10y",
 }
 US_EXCHANGES = {"NMS", "NYQ", "NGM", "NCM", "ASE", "PCX", "BTS", "NYS", "NAS", "NasdaqGS", "NYSE", "NasdaqGM"}
 EU_EXCHANGES = {"AMS", "PAR", "BRU"}
