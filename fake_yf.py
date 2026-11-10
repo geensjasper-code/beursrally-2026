@@ -6,7 +6,9 @@ reproduceerbare data, en bevat bewust een paar problemen om de controles te test
 - een ISIN die niet gevonden wordt (Energyvision),
 - af en toe een mislukte opvraging (zoals bij Yahoo),
 - een splitsing die NIET gecorrigeerd is in de koersen (SMCI),
-- recente beursintroducties (CRCL, CRWV, NBIS).
+- recente beursintroducties (CRCL, CRWV, NBIS),
+- aantal aandelen met een uitschieter en een splitsing (NVDA: ruw aantal x10 na 10-6-2024),
+- FakeFinra: shortposities twee keer per maand vanaf juni 2021.
 """
 from __future__ import annotations
 
@@ -142,6 +144,22 @@ class Ticker:
                 "industry": "x", "country": "x", "marketCap": int(rng.uniform(1e9, 3e12)),
                 "averageVolume": int(rng.uniform(1e5, 5e7)), "shortPercentOfFloat": rng.uniform(0, 0.2)}
 
+    def get_shares_full(self, start=None, end=None):
+        _maybe_fail()
+        if self.t.startswith("^") or self.t in ("EURUSD=X", "BTC-USD"):
+            return None
+        idx = _calendar(self.t)
+        idx = idx[(idx >= pd.Timestamp(start or "2016-01-01")) & (idx <= _END)]
+        rng = np.random.default_rng(_seed(self.t) + 4)
+        obs = idx[rng.random(len(idx)) < 0.08]             # onregelmatige waarnemingen, zoals bij Yahoo
+        if len(obs) == 0:
+            return None
+        sh = _raw_shares(self.t, obs)
+        if len(sh) > 20:
+            sh[len(sh) // 2] *= 3                          # een foute waarneming (komt bij Yahoo voor)
+        s = pd.Series(sh, index=obs.tz_localize("America/New_York") + pd.Timedelta(hours=9))
+        return s
+
     @property
     def options(self):
         _maybe_fail()
@@ -174,3 +192,43 @@ def _isin_to_symbol(isin: str) -> str:
     known = {"US15675D1037": "CBRS", "US74768A1043": "QNTM", "US78392B2060": "SKHY", "US84615Q1031": "SPCX",
              "NL0015073TS8": "CSG.AS"}
     return known.get(isin, "Z" + isin[2:9])
+
+
+def _raw_shares(t: str, dates: pd.DatetimeIndex) -> np.ndarray:
+    """Ruw aantal aandelen: langzaam veranderend, x10 na een (in de koersen gecorrigeerde) splitsing."""
+    rng = np.random.default_rng(_seed(t) + 5)
+    base = rng.uniform(5e7, 5e9)
+    years = (dates - pd.Timestamp("2016-01-01")).days / 365.25
+    sh = base * np.exp(rng.uniform(-0.03, 0.03) * years)
+    if t in _ADJUSTED_SPLIT:
+        sh = np.where(dates >= pd.Timestamp(_ADJUSTED_SPLIT[t]), sh * 10, sh)
+    return np.asarray(sh, dtype=float)
+
+
+class FakeFinra:
+    """Nagemaakte FINRA-API: afrekendatums rond de 15e en op de laatste werkdag van elke maand."""
+
+    def month(self, symbols, start, end):
+        _maybe_fail()
+        bd = pd.bdate_range(start, min(pd.Timestamp(end), _END - pd.Timedelta(days=10)))
+        if len(bd) == 0:
+            return []
+        dates = sorted({bd[bd.day <= 15][-1], bd[-1]} if (bd.day <= 15).any() else {bd[-1]})
+        dates = [d for d in dates if d >= pd.Timestamp("2021-06-01")]
+        rows = []
+        for sym in symbols:
+            if sym.startswith("^"):
+                continue
+            for d in dates:
+                ix = pd.DatetimeIndex([d - pd.Timedelta(days=14), d])
+                sh = _raw_shares(sym, ix)
+                r = np.random.default_rng(_seed(sym + str(d.date())))
+                r0 = np.random.default_rng(_seed(sym + str((d - pd.Timedelta(days=14)).date())))
+                pct = 0.02 + 0.10 * (_seed(sym) % 100) / 100
+                cur, prev = sh[1] * pct * r.uniform(0.8, 1.2), sh[0] * pct * r0.uniform(0.8, 1.2)
+                adv = sh[1] * 0.005
+                rows.append({"symbolCode": sym, "settlementDate": d.strftime("%Y-%m-%d"),
+                             "currentShortPositionQuantity": int(cur), "previousShortPositionQuantity": int(prev),
+                             "averageDailyVolumeQuantity": int(adv), "daysToCoverQuantity": round(cur / adv, 2),
+                             "stockSplitFlag": None, "revisionFlag": None, "marketClassCode": "NNM"})
+        return rows

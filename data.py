@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""   python data.py init --synthetic
+"""
 Beursrally 2026 - stap 1: data.
 
 Haalt alle data op via Yahoo Finance (yfinance), bewaart de ruwe downloads
@@ -9,9 +9,13 @@ Gebruik
     python data.py init        # eerste keer: alles ophalen (15-30 min) + verwerken + rapport
     python data.py update      # dagelijks: nieuwe koersen + opties; wekelijks ook cijfers en splitsingen
     python data.py report      # alleen het kwaliteitsrapport opnieuw maken
-    python data.py <taak>      # een losse taak: resolve | prices | actions | earnings | info | options | process
+    python data.py <taak>      # een losse taak: resolve | prices | actions | earnings | info | options |
+                               #                 shares | shortinterest | process
 
     --synthetic                # nepdata (fake_yf.py) om de pipeline zonder internet te testen
+
+Bronnen: Yahoo Finance (koersen, splitsingen, cijfers, aantal aandelen, opties) en FINRA (shortposities
+van Amerikaanse aandelen, twee keer per maand, sinds juni 2021).
 
 Een onderbroken run hervat automatisch: wat al binnen is, wordt niet opnieuw opgehaald.
 """
@@ -44,6 +48,9 @@ BACKOFF = float(os.environ.get("BR_BACKOFF", "1"))    # schaal van de wachttijde
 MAX_CONSECUTIVE_FAILS = 12      # zoveel mislukte opvragingen na elkaar = waarschijnlijk geblokkeerd
 OVERLAP_DAYS = 7                # bij een update de laatste dagen opnieuw ophalen (correcties van Yahoo)
 WEEKLY_EVERY_DAYS = 7           # cijfers, splitsingen en alle opties: om de zoveel dagen
+FINRA_START = "2021-06-01"      # vanaf dan publiceert FINRA ook de shortposities van beursgenoteerde aandelen
+FINRA_URL = "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
+FINRA_CDN = "https://cdn.finra.org/equity/otcmarket/biweekly/shrt{d}.csv"   # reserveroute: een bestand per datum
 
 # Markt- en regime-reeksen (Yahoo-ticker -> korte naam)
 MARKET = {
@@ -141,43 +148,81 @@ def ok_tickers(t: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- 1. tickers
+def _tickers_with_full_prices() -> set[str]:
+    """Tickers die al een volledige koershistoriek hebben in data/raw/prices (volledige of opnieuw opgehaalde download)."""
+    d = RAW / "prices"
+    files = [f for f in d.glob("*.parquet") if "_full_" in f.name or "_refetch_" in f.name] if d.exists() else []
+    return set(pd.concat([pd.read_parquet(f, columns=["ticker"]) for f in files])["ticker"]) if files else set()
+
+
+def _looks_like_isin(sym: str) -> bool:
+    base = sym.split(".")[0]
+    return len(base) == 12 and base[:2].isalpha() and any(c.isdigit() for c in base)
+
+
+def _rank_quotes(quotes: list[dict], ccy: str) -> list[str]:
+    """Zoekresultaten ordenen: eerst de beurs die bij de Beursrally past, ISIN-achtige symbolen achteraan."""
+    def score(q):
+        ex, sym = q.get("exchange", ""), q.get("symbol", "")
+        s = 0 if (ccy == "EUR" and ex in EU_EXCHANGES) or (ccy == "USD" and ex in US_EXCHANGES) else 1
+        return (s + (2 if _looks_like_isin(sym) else 0), quotes.index(q))
+    return [q["symbol"] for q in sorted(quotes, key=score) if q.get("symbol")]
+
+
 def task_resolve(yf, force: bool = False) -> None:
-    """Controleert elke ticker (beurs, munt) en zoekt ontbrekende op via ISIN."""
+    """Controleert elke ticker (beurs, munt) en zoekt ontbrekende op via ISIN en daarna via naam.
+
+    Een ticker die 'ok' stond maar geen koersen opleverde, wordt opnieuw opgezocht.
+    """
     META.mkdir(parents=True, exist_ok=True)
     out_f = META / "tickers.csv"
     done = pd.read_csv(out_f, dtype=str).set_index("isin") if out_f.exists() and not force else None
+    priced = _tickers_with_full_prices()
     u = universe()
     fx = Fetcher()
     rows = []
     log(f"Tickers controleren voor {len(u)} effecten ...")
     for _, r in u.iterrows():
-        if done is not None and r["isin"] in done.index and done.at[r["isin"], "status"] == "ok":
+        if done is not None and r["isin"] in done.index and done.at[r["isin"], "status"] == "ok" \
+                and (not priced or done.at[r["isin"], "ticker"] in priced):
             rows.append(done.loc[r["isin"]].to_dict() | {"isin": r["isin"]})
             continue
-        cands = [r["ticker"]] if isinstance(r["ticker"], str) and r["ticker"] else []
+        bad_before = {done.at[r["isin"], "ticker"]} if done is not None and r["isin"] in done.index \
+            and priced and done.at[r["isin"], "ticker"] not in priced else set()
+        hint = r["ticker"] if isinstance(r["ticker"], str) and r["ticker"] else None
+        cands = [hint] if hint and hint not in bad_before else []
         res = fx.call(lambda: yf.Search(r["isin"], max_results=10).quotes)
-        for q in res or []:
-            s = q.get("symbol")
-            if s and s not in cands:
-                cands.append(s)
-        found, fetch_failed = None, res is None
-        for t in cands:
+        quotes = list(res or [])
+        if not any(q.get("exchange") in (EU_EXCHANGES if r["ccy"] == "EUR" else US_EXCHANGES) for q in quotes):
+            byname = fx.call(lambda: yf.Search(r["name"], max_results=10).quotes)   # ISIN gaf niets bruikbaars
+            quotes += list(byname or [])
+        for sym in _rank_quotes(quotes, r["ccy"]):
+            if sym not in cands and sym not in bad_before:
+                cands.append(sym)
+        found, fallback, fetch_failed = None, None, res is None
+        for t in cands[:8]:
             info = fx.call(_fast_info, yf, t)
             if info is None:                       # opvraging mislukt: niet stilletjes een andere notering kiezen
                 fetch_failed = True
                 break
-            if not info.get("currency") or not info.get("lastPrice"):
-                continue
+            price = info.get("lastPrice")
+            if not info.get("currency") or price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                continue                           # geen (geldige) koers: deze notering niet gebruiken
             exch = str(info.get("exchange", ""))
-            # voorkeur: de beurs die bij de munt van de Beursrally past
-            if r["ccy"] == "EUR" and exch not in EU_EXCHANGES and t != cands[-1]:
-                continue
-            found = (t, info["currency"], exch, info.get("quoteType", ""))
-            break
+            cand = (t, info["currency"], exch, info.get("quoteType", ""))
+            right_place = (r["ccy"] == "EUR" and exch in EU_EXCHANGES) or \
+                          (r["ccy"] == "USD" and (exch in US_EXCHANGES or info["currency"] == "USD"))
+            if right_place:
+                found = cand
+                break
+            fallback = fallback or cand            # bruikbaar, maar niet de Beursrally-notering
+        found = found or fallback
         if found:
             rows.append({"isin": r["isin"], "name": r["name"], "type": r["type"], "ccy_beursrally": r["ccy"],
                          "ticker": found[0], "currency": found[1], "exchange": found[2],
                          "quote_type": found[3], "status": "ok"})
+            if hint and found[0] != hint:
+                log(f"  {r['name']}: {hint} werkte niet, gekozen: {found[0]} ({found[2]}, {found[1]})")
         else:
             status = "opvraging mislukt" if fetch_failed else "niet gevonden"
             rows.append({"isin": r["isin"], "name": r["name"], "type": r["type"], "ccy_beursrally": r["ccy"],
@@ -200,9 +245,9 @@ def task_resolve(yf, force: bool = False) -> None:
     if ff:
         log(f"{ff} opvragingen mislukt. Draai 'resolve' later opnieuw; die worden dan opnieuw geprobeerd.")
     if len(mism):
-        log(f"Let op: {len(mism)} effecten noteren bij Yahoo in een andere munt dan op de Beursrally:")
+        log(f"Let op: {len(mism)} effecten noteren bij Yahoo in een andere munt of beurs dan op de Beursrally:")
         for _, r in mism.iterrows():
-            log(f"  {r['name']}: Yahoo {r['currency']} ({r['ticker']}), Beursrally {r['ccy_beursrally']}")
+            log(f"  {r['name']}: Yahoo {r['currency']} ({r['ticker']}, {r['exchange']}), Beursrally {r['ccy_beursrally']}")
 
 
 def _fast_info(yf, t: str) -> dict:
@@ -283,6 +328,10 @@ def task_prices(yf, full: bool = False, only: list[str] | None = None) -> None:
     if failed:
         log(f"{failed} groepjes mislukt: draai hetzelfde commando opnieuw om aan te vullen.")
     if start != START and not only:
+        no_full = sorted(set(tickers) - _tickers_with_full_prices())
+        if no_full:
+            log(f"Nog geen volledige historiek voor {len(no_full)} tickers: die worden nu volledig opgehaald.")
+            task_prices(yf, full=True, only=no_full)
         changed = _changed_history(allp, before=run_start)
         if changed:
             log(f"Oude koersen gewijzigd bij Yahoo (splitsing?) voor {changed}: volledige historiek opnieuw ophalen.")
@@ -449,6 +498,190 @@ def task_options(yf, focus: bool = False):
     _per_ticker(yf, "options", focus_list(t) if focus else us_stocks(t), _options, 0)
 
 
+# --------------------------------------------------------------------------- 5b. aantal aandelen (historiek)
+def _shares(yf, t):
+    """Aantal uitstaande aandelen door de tijd (Yahoo). Ruwe aantallen: NIET gecorrigeerd voor splitsingen."""
+    s = yf.Ticker(t).get_shares_full(start=START)
+    if s is None or len(s) == 0:
+        return pd.DataFrame()
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    idx = s.index.tz_convert("Europe/Brussels").tz_localize(None) if s.index.tz is not None else s.index
+    return pd.DataFrame({"ts": idx, "shares": pd.to_numeric(s.values, errors="coerce")})
+
+
+def task_shares(yf, refresh_days=0):
+    t = ok_tickers(tickers_table())
+    _per_ticker(yf, "shares", t[t["type"] == "stock"]["ticker"].tolist(), _shares, refresh_days)
+
+
+# --------------------------------------------------------------------------- 5c. shortposities (FINRA)
+FINRA_COLS = ["symbolCode", "settlementDate", "currentShortPositionQuantity", "previousShortPositionQuantity",
+              "averageDailyVolumeQuantity", "daysToCoverQuantity", "stockSplitFlag", "revisionFlag",
+              "marketClassCode"]
+
+
+def finra_symbol(ticker: str) -> str:
+    """Yahoo schrijft BRK-B, FINRA BRK.B."""
+    return ticker.replace("-", ".")
+
+
+class FinraUnavailable(RuntimeError):
+    """FINRA geeft geen antwoord (geblokkeerd, offline, gewijzigd): shortposities overslaan, rest gaat door."""
+
+
+class FinraClient:
+    """Openbare FINRA-API (geen account nodig). Haalt de shortposities van een maand op voor onze symbolen.
+
+    Lukt de API niet (of geeft ze voor oude maanden niets), dan proberen we de losse bestanden per datum.
+    """
+
+    def __init__(self):
+        import requests
+        self.requests = requests
+        self.s = requests.Session()
+        self.s.headers.update({"Accept": "application/json", "Content-Type": "application/json",
+                               "User-Agent": "beursrally-research (python requests)"})
+        self.symbol_filter = True                 # valt terug op 'alles ophalen en zelf filteren' als FINRA weigert
+
+    def month(self, symbols: list[str], start: str, end: str) -> list[dict]:
+        self.answered = False                     # gaf minstens een bron een geldig antwoord?
+        try:
+            rows = self._api(symbols, start, end)
+            self.answered = True
+        except self.requests.HTTPError as e:     # 401/403/404: API niet bruikbaar -> reserveroute
+            code = e.response.status_code if e.response is not None else None
+            if code in (429, 500, 502, 503, 504):
+                raise                             # tijdelijk: Fetcher wacht en probeert opnieuw
+            rows = []
+        if not rows:
+            rows = self._cdn(symbols, start, end)
+        if not rows and not self.answered:
+            raise FinraUnavailable("FINRA-API en reservebestanden geven geen antwoord")
+        return rows
+
+    def _api(self, symbols, start, end) -> list[dict]:
+        wanted, rows, offset, limit = set(symbols), [], 0, 5000
+        while True:
+            body = {"limit": limit, "offset": offset,
+                    "dateRangeFilters": [{"fieldName": "settlementDate", "startDate": start, "endDate": end}]}
+            if self.symbol_filter:
+                body["domainFilters"] = [{"fieldName": "symbolCode", "values": symbols}]
+            r = self.s.post(FINRA_URL, json=body, timeout=90)
+            if r.status_code == 400 and self.symbol_filter:
+                log("  FINRA weigert de symboolfilter: alles ophalen en zelf filteren (trager).")
+                self.symbol_filter = False
+                continue
+            if r.status_code == 204 or not r.text.strip():
+                break
+            r.raise_for_status()                  # 429/5xx -> fout -> Fetcher probeert opnieuw met wachttijd
+            page = r.json()
+            rows += [x for x in page if x.get("symbolCode") in wanted]
+            if len(page) < limit:
+                break
+            offset += limit
+            time.sleep(PAUSE)
+        return rows
+
+    def _cdn(self, symbols, start, end) -> list[dict]:
+        """Reserveroute: bestanden shrtYYYYMMDD.csv. Afrekendatums: rond de 15e en de laatste werkdag."""
+        import io
+        wanted, rows = set(symbols), []
+        bd = pd.bdate_range(start, end)
+        if len(bd) == 0:
+            return rows
+        mid = bd[bd.day <= 15]
+        tries = list(mid[-2:]) + list(bd[-2:])
+        found_mid = found_end = False
+        for d in tries:
+            is_mid = d.day <= 15
+            if (is_mid and found_mid) or (not is_mid and found_end):
+                continue
+            r = self.s.get(FINRA_CDN.format(d=d.strftime("%Y%m%d")), timeout=90)
+            time.sleep(PAUSE)
+            if r.status_code == 404:
+                self.answered = True              # server antwoordt: er is gewoon geen bestand op die dag
+                continue
+            if r.status_code != 200 or not r.text.strip():
+                continue
+            self.answered = True
+            df = pd.read_csv(io.StringIO(r.text), sep="|", dtype=str)
+            if "symbolCode" not in df.columns:
+                continue
+            df = df[df["symbolCode"].isin(wanted)]
+            if "settlementDate" not in df.columns:
+                df["settlementDate"] = d.strftime("%Y-%m-%d")
+            rows += df.to_dict("records")
+            found_mid, found_end = found_mid or is_mid, found_end or not is_mid
+        return rows
+
+
+def get_finra(synthetic: bool):
+    if synthetic:
+        import fake_yf
+        return fake_yf.FakeFinra()
+    return FinraClient()
+
+
+def task_shortinterest(finra, full: bool = False) -> None:
+    """Shortposities per maand -> data/raw/finra/YYYYMM.parquet (alleen Amerikaanse aandelen uit onze lijst).
+
+    Een maand is 'af' als ze opgehaald werd meer dan 20 dagen na het einde van de maand (alles gepubliceerd);
+    zo'n maand wordt niet opnieuw gevraagd, tenzij met --full.
+    """
+    t = tickers_table()
+    symbols = sorted({finra_symbol(x) for x in us_stocks(t)})
+    if not symbols:
+        log("Shortposities: geen Amerikaanse aandelen in de lijst.")
+        return
+    out = RAW / "finra"
+    out.mkdir(parents=True, exist_ok=True)
+    months = pd.period_range(FINRA_START, pd.Timestamp.now(), freq="M")
+    todo = []
+    for m in months:
+        f = out / f"{m.strftime('%Y%m')}.parquet"
+        marker = out / f"{m.strftime('%Y%m')}.empty"
+        done_at = None
+        if f.exists():
+            done_at = pd.read_parquet(f, columns=["downloaded"])["downloaded"].max()
+        elif marker.exists():
+            done_at = pd.Timestamp(marker.read_text().strip())
+        complete = done_at is not None and done_at > m.end_time + pd.Timedelta(days=20)
+        if full or not complete:
+            todo.append(m)
+    log(f"Shortposities (FINRA): {len(symbols)} symbolen, {len(todo)} van {len(months)} maanden op te halen ...")
+    n_rows = 0
+    for m in todo:
+        start, end = m.start_time.strftime("%Y-%m-%d"), m.end_time.strftime("%Y-%m-%d")
+        try:
+            rows = finra.month(symbols, start, end)
+        except FinraUnavailable:
+            log("  FINRA is niet bereikbaar: shortposities overgeslagen (de rest van de data gaat gewoon door).")
+            break
+        except Exception as e:  # noqa: BLE001 - tijdelijke fout: een keer opnieuw na een pauze
+            time.sleep(10 * BACKOFF)
+            try:
+                rows = finra.month(symbols, start, end)
+            except Exception:  # noqa: BLE001
+                log(f"  {m}: mislukt ({e}); volgende run opnieuw. Shortposities voorlopig overgeslagen.")
+                break
+        stem = out / m.strftime("%Y%m")
+        if not rows:
+            Path(f"{stem}.empty").write_text(str(pd.Timestamp.now()))
+            continue
+        df = pd.DataFrame(rows)
+        for c in FINRA_COLS:
+            if c not in df.columns:
+                df[c] = None
+        df = df[FINRA_COLS].astype(str).replace({"None": None, "nan": None})
+        df["downloaded"] = pd.Timestamp.now()
+        df.to_parquet(f"{stem}.parquet", index=False)
+        Path(f"{stem}.empty").unlink(missing_ok=True)
+        n_rows += len(df)
+    have = sorted(f.stem for f in out.glob("*.parquet"))
+    log(f"Shortposities: {n_rows} rijen opgehaald; maanden met data: "
+        f"{have[0] if have else '-'} tot {have[-1] if have else '-'} ({len(have)} maanden).")
+
+
 # --------------------------------------------------------------------------- 6. verwerken
 def _latest_per_ticker(kind: str) -> pd.DataFrame:
     """Voegt alle downloads van een soort samen; per ticker telt de recentste download."""
@@ -520,11 +753,14 @@ def task_process() -> None:
                      ("market_close", mk), ("market_logret", mk_lr)]:
         df.to_parquet(PROC / f"{name}.parquet")
 
-    for kind in ("actions", "earnings", "info"):
+    for kind in ("actions", "earnings", "info", "shares"):
         d = _latest_per_ticker(kind)
         if not d.empty:
             d.insert(0, "isin", d["ticker"].map(tick2isin))
             d.to_parquet(PROC / f"{kind}.parquet", index=False)
+    si = _process_short_interest(t)
+    if not si.empty:
+        si.to_parquet(PROC / "short_interest.parquet", index=False)
     opt_days = sorted(p.name for p in (RAW / "options").glob("*") if p.is_dir()) if (RAW / "options").exists() else []
     for day in opt_days:                                   # een bestand per momentopname
         fs = list((RAW / "options" / day).glob("*.parquet"))
@@ -534,6 +770,29 @@ def task_process() -> None:
             o.to_parquet(PROC / f"options_{day}.parquet", index=False)
     log(f"Verwerkt: {close_eur.shape[1]} effecten, {len(cal)} beursdagen "
         f"({cal.min().date()} tot {cal.max().date()}) -> data/processed/")
+
+
+def _process_short_interest(t: pd.DataFrame) -> pd.DataFrame:
+    """FINRA-maanden samenvoegen; bij een herziening telt de recentste download. Symbool -> ISIN."""
+    files = sorted((RAW / "finra").glob("*.parquet")) if (RAW / "finra").exists() else []
+    if not files:
+        return pd.DataFrame()
+    f = pd.concat([pd.read_parquet(x) for x in files], ignore_index=True)
+    sym2isin = {finra_symbol(k): v for k, v in zip(ok_tickers(t)["ticker"], ok_tickers(t)["isin"])
+                if k in set(us_stocks(t))}
+    out = pd.DataFrame({
+        "isin": f["symbolCode"].map(sym2isin),
+        "symbol": f["symbolCode"],
+        "settlement_date": pd.to_datetime(f["settlementDate"], errors="coerce"),
+        "short_qty": pd.to_numeric(f["currentShortPositionQuantity"], errors="coerce"),
+        "prev_short_qty": pd.to_numeric(f["previousShortPositionQuantity"], errors="coerce"),
+        "avg_daily_volume": pd.to_numeric(f["averageDailyVolumeQuantity"], errors="coerce"),
+        "days_to_cover": pd.to_numeric(f["daysToCoverQuantity"], errors="coerce"),
+        "split_flag": f["stockSplitFlag"], "revision_flag": f["revisionFlag"],
+        "downloaded": f["downloaded"]})
+    out = out.dropna(subset=["isin", "settlement_date", "short_qty"])
+    out = out.sort_values("downloaded").drop_duplicates(["isin", "settlement_date"], keep="last")
+    return out.sort_values(["isin", "settlement_date"]).reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------- 7. kwaliteitsrapport
@@ -603,6 +862,17 @@ def task_report() -> pd.DataFrame:
               f"{int(st['volgende_cijfers'].notna().sum())} met een datum in de toekomst")
     if "opties" in rep:
         print(f"Opties (laatste momentopname): {int((rep['opties'].fillna(0) > 0).sum())} aandelen")
+    if (PROC / "shares.parquet").exists():
+        sh = pd.read_parquet(PROC / "shares.parquet")
+        n_obs = sh.groupby("isin").size()
+        first = sh.groupby("isin")["ts"].min()
+        print(f"Aantal aandelen (historiek): {sh['isin'].nunique()} aandelen, mediaan {int(n_obs.median())} "
+              f"waarnemingen, mediaan vanaf {first.median().date()}")
+    if (PROC / "short_interest.parquet").exists():
+        si = pd.read_parquet(PROC / "short_interest.parquet")
+        print(f"Shortposities (FINRA): {si['isin'].nunique()} van {len(us_stocks(t))} VS-aandelen, "
+              f"{si['settlement_date'].nunique()} afrekendatums "
+              f"({si['settlement_date'].min().date()} tot {si['settlement_date'].max().date()})")
     prob = rep[rep["probleem"].fillna("") != ""]
     if len(prob):
         print(f"\n{len(prob)} effecten met opmerkingen (volledige lijst: data/kwaliteitsrapport.csv):")
@@ -615,12 +885,14 @@ def task_report() -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- samengestelde taken
-def task_init(yf):
+def task_init(yf, finra):
     task_resolve(yf)
     task_prices(yf, full=True)
     task_actions(yf)
     task_earnings(yf)
     task_info(yf)
+    task_shares(yf)
+    task_shortinterest(finra)
     task_options(yf)
     task_process()
     task_report()
@@ -629,7 +901,7 @@ def task_init(yf):
     save_state(st)
 
 
-def task_update(yf):
+def task_update(yf, finra):
     st = load_state()
     if not st.get("prices_last_date"):
         sys.exit("Nog geen data. Eerst:  python data.py init")
@@ -640,6 +912,7 @@ def task_update(yf):
         log("Wekelijkse vernieuwing: splitsingen, kwartaalcijfers, alle opties.")
         task_actions(yf)
         task_earnings(yf)
+        task_shares(yf)
         task_options(yf, focus=False)
         refetch_split_tickers(yf)
         st = load_state()
@@ -647,6 +920,7 @@ def task_update(yf):
         save_state(st)
     else:
         task_options(yf, focus=True)
+    task_shortinterest(finra)                 # elke dag: kost 1-2 opvragingen (alleen de onafgewerkte maanden)
     task_process()
     task_report()
 
@@ -669,16 +943,18 @@ def refetch_split_tickers(yf):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("task", choices=["init", "update", "report", "resolve", "prices", "actions", "earnings",
-                                     "info", "options", "process"])
+                                     "info", "options", "shares", "shortinterest", "process"])
     ap.add_argument("--synthetic", action="store_true", help="nepdata via fake_yf.py (test zonder internet)")
     ap.add_argument("--force", action="store_true", help="resolve: alle tickers opnieuw controleren")
-    ap.add_argument("--full", action="store_true", help="prices: volledige historiek opnieuw ophalen")
+    ap.add_argument("--full", action="store_true",
+                    help="prices/shortinterest: volledige historiek opnieuw ophalen")
     a = ap.parse_args()
     yf = get_yf(a.synthetic)
+    finra = get_finra(a.synthetic)
     try:
         {
-            "init": lambda: task_init(yf),
-            "update": lambda: task_update(yf),
+            "init": lambda: task_init(yf, finra),
+            "update": lambda: task_update(yf, finra),
             "report": task_report,
             "resolve": lambda: task_resolve(yf, force=a.force),
             "prices": lambda: task_prices(yf, full=a.full),
@@ -686,6 +962,8 @@ def main():
             "earnings": lambda: task_earnings(yf),
             "info": lambda: task_info(yf),
             "options": lambda: task_options(yf),
+            "shares": lambda: task_shares(yf),
+            "shortinterest": lambda: task_shortinterest(finra, full=a.full),
             "process": task_process,
         }[a.task]()
     except BlockedError as e:

@@ -1,6 +1,6 @@
 # Stap 1 — Data
 
-`data.py` haalt alle data op via Yahoo Finance, bewaart de ruwe downloads ongewijzigd in `data/raw/`
+`data.py` haalt alle data op via Yahoo Finance (en de shortposities via FINRA), bewaart de ruwe downloads ongewijzigd in `data/raw/`
 en bouwt daaruit nette tabellen in `data/processed/`.
 
 ## Installeren
@@ -44,7 +44,9 @@ python data.py report    # alleen het kwaliteitsrapport opnieuw tonen
 | `prices` | Open, High, Low, Close (alleen gecorrigeerd voor splitsingen), Volume + marktreeksen + EUR/USD | Dagelijks |
 | `actions` | Splitsingen en dividenden | Wekelijks |
 | `earnings` | Datums en winstverrassingen van kwartaalcijfers | Wekelijks |
-| `info` | Sector, marktkapitalisatie, shortpositie | Alleen bij `init` |
+| `info` | Sector, marktkapitalisatie, shortpositie (momentopname, alleen live) | Alleen bij `init` |
+| `shares` | Aantal uitstaande aandelen door de tijd (voor historische marktkapitalisatie) | Wekelijks |
+| `shortinterest` | FINRA-shortposities van de VS-aandelen, 2x per maand, sinds juni 2021 | Dagelijks (alleen de onafgewerkte maanden) |
 | `options` | Momentopname van opties rond de koers, vervaldagen rond 22 januari 2027 | Dagelijks (focus), wekelijks (alle) |
 | `process` | Alles samenvoegen tot tabellen in euro | Dagelijks |
 | `report` | Kwaliteitsrapport | Dagelijks |
@@ -62,8 +64,9 @@ Ingebouwde controles:
 | `close_eur`, `open_eur` | Slot- en openingskoersen in euro (dagen × ISIN) |
 | `close_local`, `high_local`, `low_local`, `volume` | In de eigen munt (voor schatters op hoog/laag) |
 | `logret_eur` | Dagelijkse log-rendementen in euro |
-| `market_close`, `market_logret` | S&P 500, Nasdaq 100, STOXX 600, MSCI World, VIX, VXN, bitcoin, EUR/USD |
-| `actions`, `earnings`, `info` | Lange tabellen per ISIN |
+| `market_close`, `market_logret` | S&P 500, Nasdaq 100, STOXX 600, MSCI World, VIX, VXN, bitcoin, EUR/USD, VS-rentes |
+| `actions`, `earnings`, `info`, `shares` | Lange tabellen per ISIN |
+| `short_interest` | Per ISIN en afrekendatum: shortpositie, gemiddeld volume, days to cover |
 | `options_<datum>` | Een momentopname van de opties per dag |
 
 Plus `data/kwaliteitsrapport.csv` en `data/meta/tickers.csv`.

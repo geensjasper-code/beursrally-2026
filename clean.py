@@ -13,6 +13,8 @@ Wat het doet
     4. De eerste 10 handelsdagen na een beursintroductie weg.
     5. Rendementen opnieuw berekenen op de eigen geldige dagen; rentes als verandering in niveau.
     6. Nieuwe artefact-kandidaten zoeken en melden (niet automatisch toepassen).
+    7. Aantal aandelen en shortposities: omzetten naar dezelfde basis als de koersen (splitsingen) en
+       een publicatietijdstip (known_at) geven.
 
 Alle modellen halen hun data via PointInTime.as_of(t): alleen wat op tijdstip t bekend was.
 """
@@ -50,6 +52,9 @@ MARKET_ZONE = {
 }
 RATE_SERIES = {"us_rate_3m", "us_rate_10y"}           # niveaus in %, geen prijzen
 LIVE_ONLY = {"info"}                                  # momentopnames: nooit in een backtest
+SHARES_LAG_DAYS = 45        # aantal aandelen: datum = einde kwartaal, publicatie pas weken later (10-Q)
+SHORT_LAG_BDAYS = 9         # FINRA publiceert ~7 werkdagen na de afrekendatum; 2 dagen marge voor feestdagen
+KNOWN_AT_TABLES = ("earnings", "shares", "short_interest")
 
 
 def log(msg: str) -> None:
@@ -243,6 +248,7 @@ def run_clean() -> None:
     zone.to_frame().to_csv(CLEAN / "zones.csv")
     cand.to_csv(DATA / "artefact_kandidaten.csv", index=False)
     prepare_earnings()
+    sh_stats = prepare_shares_and_short()
 
     removed = int(lr_raw.notna().sum().sum() - lr.notna().sum().sum())
     print("\n================ OPSCHONEN ================")
@@ -259,6 +265,8 @@ def run_clean() -> None:
         print(show[["naam", "datum", "totaal", "overnight", "tijdens_dag", "in_de_buurt", "oordeel"]]
               .to_string(index=False))
         print("\nEen echt artefact? Voeg het toe aan artefacten.csv (dag_weg) en draai clean.py opnieuw.")
+    for k, v in sh_stats.items():
+        print(f"{k:<52} {v}")
     print(f"\nOpgeschoonde data: {lr.shape[1]} effecten, {lr.notna().any(axis=1).sum()} dagen -> data/clean/")
     print("===========================================\n")
 
@@ -280,8 +288,9 @@ class PointInTime:
                     "market_ret": pd.read_parquet(CLEAN / "market_ret.parquet")}
             z = pd.read_csv(CLEAN / "zones.csv", index_col=0)["zone"]
             data["zones"] = z.to_dict()
-            ef = CLEAN / "earnings.parquet"
-            data["earnings"] = pd.read_parquet(ef) if ef.exists() else pd.DataFrame()
+            for k in KNOWN_AT_TABLES:
+                f = CLEAN / f"{k}.parquet"
+                data[k] = pd.read_parquet(f) if f.exists() else pd.DataFrame()
         self.d = data
 
     def _mask(self, df: pd.DataFrame, t: pd.Timestamp, zones: dict) -> pd.DataFrame:
@@ -299,6 +308,9 @@ class PointInTime:
         t = pd.Timestamp(t)
         if table == "earnings":
             return self.earnings_as_of(t)
+        if table in ("shares", "short_interest"):
+            e = self.d.get(table, pd.DataFrame())
+            return e[e["known_at"] <= t].copy() if not e.empty else e
         if table.startswith("market"):
             return self._mask(self.d[table], t, MARKET_ZONE)
         return self._mask(self.d[table], t, self.d["zones"])
@@ -336,6 +348,62 @@ def prepare_earnings() -> None:
                        .dt.tz_convert("Europe/Brussels").dt.tz_localize(None))
     e = e.dropna(subset=["known_at"])
     e.to_parquet(CLEAN / "earnings.parquet", index=False)
+
+
+def split_factor_after(isin_dates: pd.DataFrame, actions: pd.DataFrame) -> np.ndarray:
+    """Product van alle splitsingsverhoudingen NA elke datum: zo zet je een ruw aantal om naar de basis van
+    de (voor splitsingen gecorrigeerde) koersen. Ruwe koers op dag s = gecorrigeerde koers x deze factor."""
+    out = np.ones(len(isin_dates))
+    if actions.empty or "stock_splits" not in actions:
+        return out
+    sp = actions[actions["stock_splits"] > 0][["isin", "date", "stock_splits"]]
+    if sp.empty:
+        return out
+    by = {i: g for i, g in sp.groupby("isin")}
+    for n, (i, d) in enumerate(zip(isin_dates["isin"], isin_dates["date"])):
+        g = by.get(i)
+        if g is not None:
+            out[n] = float(np.prod(g.loc[g["date"] > d, "stock_splits"].to_numpy()))
+    return out
+
+
+def prepare_shares_and_short() -> dict:
+    """Aantal aandelen (Yahoo) en shortposities (FINRA) -> data/clean/, met known_at en splitsingscorrectie."""
+    stats = {}
+    act = pd.read_parquet(PROC / "actions.parquet") if (PROC / "actions.parquet").exists() else pd.DataFrame()
+    if not act.empty:
+        act["date"] = pd.to_datetime(act["date"])
+
+    f = PROC / "shares.parquet"
+    if f.exists():
+        sh = pd.read_parquet(f).dropna(subset=["isin"])
+        sh = sh[pd.to_numeric(sh["shares"], errors="coerce") > 0].copy()
+        sh["ts"] = pd.to_datetime(sh["ts"])
+        sh = sh.sort_values(["isin", "ts"]).drop_duplicates(["isin", "ts"], keep="last")
+        sh["shares_adj"] = sh["shares"].astype(float) * split_factor_after(
+            sh[["isin", "ts"]].rename(columns={"ts": "date"}), act)
+        # uitschieters: afwijking > 50% van de mediaan van de VORIGE 5 waarnemingen (alleen terugkijken)
+        med = sh.groupby("isin")["shares_adj"].transform(lambda x: x.shift(1).rolling(5, min_periods=3).median())
+        out = (np.log(sh["shares_adj"] / med).abs() > np.log(1.5)) & med.notna()
+        stats["aantal aandelen: uitschieters verwijderd"] = int(out.sum())
+        sh = sh[~out]
+        sh["known_at"] = sh["ts"].dt.normalize() + pd.Timedelta(days=SHARES_LAG_DAYS)
+        sh[["isin", "ts", "known_at", "shares", "shares_adj"]].to_parquet(CLEAN / "shares.parquet", index=False)
+        stats["aantal aandelen: effecten met historiek"] = sh["isin"].nunique()
+
+    f = PROC / "short_interest.parquet"
+    if f.exists():
+        si = pd.read_parquet(f).dropna(subset=["isin", "settlement_date", "short_qty"]).copy()
+        si["settlement_date"] = pd.to_datetime(si["settlement_date"])
+        si = si.sort_values(["isin", "settlement_date"])
+        fac = split_factor_after(si[["isin", "settlement_date"]].rename(columns={"settlement_date": "date"}), act)
+        si["short_adj"] = si["short_qty"] * fac
+        si["adv_adj"] = si["avg_daily_volume"] * fac
+        si["known_at"] = si["settlement_date"] + pd.offsets.BDay(SHORT_LAG_BDAYS)
+        si[["isin", "settlement_date", "known_at", "short_qty", "short_adj", "adv_adj", "days_to_cover",
+            "split_flag", "revision_flag"]].to_parquet(CLEAN / "short_interest.parquet", index=False)
+        stats["shortposities: VS-aandelen / afrekendatums"] = f"{si['isin'].nunique()} / {si['settlement_date'].nunique()}"
+    return stats
 
 
 # --------------------------------------------------------------------------- lektest
@@ -402,7 +470,7 @@ def run_fixed_checks() -> bool:
     eu = [c for c, z in zones.items() if z == "EU" and c in close.columns]
     usd = [c for c, z in zones.items() if z == "24" and c in close.columns]
     days = close.index[(close[eu].notna().sum(axis=1) > 10) & (close[usd].notna().sum(axis=1) > 10)]
-    winter = days[(days.month == 1) & (days.dayofweek < 4)]       # januari: geen gedoe met zomertijd
+    winter = days[(days.month == 1) & (days.day_of_week < 4)]       # januari: geen gedoe met zomertijd
     d = winter[len(winter) // 2] if len(winter) else days[len(days) // 2]
     ok = True
 
@@ -444,6 +512,23 @@ def run_fixed_checks() -> bool:
         check("cijfers 16u30 NY: om 22u45 wel gepubliceerd", len(t2245) == 1 and t2245["gepubliceerd"].iloc[0])
         nov = pd.Timestamp("2021-11-05 16:30").tz_localize("America/New_York").tz_convert("Europe/Brussels")
         check("zomertijdverschil: 16u30 NY op 5-11-2021 = 21u30 Belgische tijd", nov.hour == 21 and nov.minute == 30)
+
+    si = pit.d.get("short_interest", pd.DataFrame())
+    if not si.empty:
+        r = si.iloc[len(si) // 2]
+        s0 = r["settlement_date"]
+        seen = lambda t: ((pit.as_of("short_interest", t)["isin"] == r["isin"]) &
+                          (pit.as_of("short_interest", t)["settlement_date"] == s0)).any()
+        check(f"short afrekendatum {s0.date()}: 7 kalenderdagen later nog niet bekend",
+              not seen(s0 + pd.Timedelta(days=7, hours=12)))
+        check(f"short afrekendatum {s0.date()}: 16 kalenderdagen later wel bekend",
+              seen(s0 + pd.Timedelta(days=16)))
+    sh = pit.d.get("shares", pd.DataFrame())
+    if not sh.empty:
+        r = sh.iloc[len(sh) // 2]
+        vis = lambda t: (pit.as_of("shares", t)["ts"] == r["ts"]).any()
+        check("aantal aandelen: 30 dagen na de datum nog niet bekend, 46 dagen erna wel",
+              not vis(r["ts"] + pd.Timedelta(days=30)) and vis(r["ts"].normalize() + pd.Timedelta(days=46)))
     return ok
 
 
