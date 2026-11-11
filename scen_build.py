@@ -68,6 +68,12 @@ def main():
     tk = pd.read_csv(DATA / "meta" / "tickers.csv", dtype=str)
     us = set(tk.loc[tk["exchange"].isin(US_EXCHANGES), "isin"])
     p = build_params(mu, var, R, data_date, start=start, us=us)
+    f_shape = OUT / "vorm_keuze.json"
+    if f_shape.exists():
+        import json
+        from scen_core import Shape
+        d = json.loads(f_shape.read_text())
+        p.shape = Shape(int(d["nu"]), float(d["vol_markt"]), float(d["vol_aandeel"]))
     OUT.mkdir(parents=True, exist_ok=True)
     save_params(p, OUT / "params_vandaag.npz")
     names = vol["naam"].to_dict()
@@ -80,7 +86,8 @@ def main():
         f"VS-notering (dicht op 26 nov en 18 jan): {len(us & set(p.isins))}")
     if p.info["zonder_correlaties"]:
         log("  aangevuld: " + ", ".join(names.get(i, i) for i in p.info["zonder_correlaties"]))
-    log(f"Rekenen op: {kind}" + (f" ({dev})" if dev is not None else ""))
+    log(f"Rekenen op: {kind}" + (f" ({dev})" if dev is not None else "") + f" | vorm: {p.shape.label()}"
+        + ("" if f_shape.exists() else " (nog geen vorm gekozen: python scen_backtest.py --grid)"))
 
     t0 = time.time()
     final = np.concatenate([c[:, -1, :] for c in generate(p, N_CHECK, seed=0)])   # (paden, aandelen)
@@ -88,7 +95,7 @@ def main():
 
     # 1. controle: vindt de simulatie de voorspelling terug? (volledige periode vanaf dag 1 van de voorspelling)
     from scen_core import Params
-    full = Params(p.isins, p.dates, 0, p.drift, p.sd, p.root)
+    full = Params(p.isins, p.dates, 0, p.drift, p.sd, p.root, shape=p.shape)
     sims = np.concatenate([c[:, [h - 1 for h in HORIZONS if h <= p.T], :] for c in generate(full, N_CHECK, seed=1)])
     eu = np.array([i not in us for i in p.isins])                 # EU: kalenderdag h = eigen beursdag h
     print("\n================ CONTROLE: SIMULATIE TEGENOVER VOORSPELLING ================")
@@ -104,7 +111,7 @@ def main():
     # 2. eerste beeld van de uitkomsten tot 22 januari
     simple = np.expm1(final.astype(np.float64))
     q = lambda a, s: np.quantile(a, s)
-    print(f"\n================ UITKOMSTEN TOT {p.dates[-1].date()} (normale schokken, deel 4a) ================")
+    print(f"\n================ UITKOMSTEN TOT {p.dates[-1].date()} (vorm: {p.shape.label()}) ================")
     vol48 = np.sqrt(simple.var(0))
     t = pd.DataFrame({"naam": [names.get(i, i) for i in p.isins], "ticker": [tick.get(i, "") for i in p.isins],
                       "mediaan": np.median(simple, 0), "p5": np.quantile(simple, 0.05, 0),
@@ -128,7 +135,7 @@ def main():
                    ("10 meest beweeglijke, gelijk gewogen", port),
                    ("alle effecten, gelijk gewogen", allw)):
         print(f"  {lab:<45}" + "".join(f"{pct(v):>9}" for v in q(x, [0.05, 0.25, 0.5, 0.75, 0.95])))
-    print("\nDit is deel 4a (normale verdeling). Of de staarten en de samenhang kloppen, toetst deel 4b op de historiek.")
+    print("\nVorm (staarten, stressdagen, vol-onzekerheid) gekozen met scen_backtest.py --grid op 2019-2021.")
     print("==========================================================================================")
     log("Klaar.")
 

@@ -40,6 +40,8 @@ CLOSED = pd.to_datetime(["2026-12-25", "2027-01-01"])        # beurzen in Europa
 US_CLOSED = pd.to_datetime(["2026-11-26", "2027-01-18"])     # alleen VS dicht (Thanksgiving, Martin Luther King)
 MIN_DAY_VAR = 1e-8
 DEVICE = os.environ.get("BR_SCEN_DEVICE", "auto")             # auto: GPU als PyTorch er een ziet
+MAX_GAIN = 15.0                                               # +1500% (x16) vanaf de start: daarboven blijft het staan
+CAP_LOG = float(np.log1p(MAX_GAIN))
 
 
 def trading_days(after: pd.Timestamp, until: pd.Timestamp = END) -> pd.DatetimeIndex:
@@ -106,6 +108,22 @@ def corr_root(R: np.ndarray) -> np.ndarray:
     return vec * np.sqrt(np.maximum(val, 0.0))
 
 
+@dataclass(frozen=True)
+class Shape:
+    """Vorm van de verdeling (deel 4c). Elke uitbreiding laat de VERWACHTE variantie per aandeel ongemoeid
+    (alle vermenigvuldigers hebben gemiddelde 1); ze veranderen alleen de staarten en de samenhang.
+      nu           stressdagen: per dag een gemeenschappelijke schaal W = (nu-2)/chi2(nu) voor alle aandelen
+                   (meerdimensionale t-verdeling). 0 = uit (normaal). Geheel getal >= 4.
+      vol_markt    onzekerheid over de vol, gemeenschappelijk: per scenario variantie x exp(s*g - s^2/2)
+      vol_aandeel  idem per aandeel per scenario: dit aandeel is de hele periode wilder of rustiger"""
+    nu: int = 0
+    vol_markt: float = 0.0
+    vol_aandeel: float = 0.0
+
+    def label(self) -> str:
+        return f"nu={self.nu or 'normaal'}, vol_markt={self.vol_markt:.2f}, vol_aandeel={self.vol_aandeel:.2f}"
+
+
 @dataclass
 class Params:
     isins: list[str]
@@ -115,6 +133,7 @@ class Params:
     sd: np.ndarray                     # (T, N) standaardafwijking per dag
     root: np.ndarray                   # (N, N) wortel van de correlatiematrix
     info: dict = field(default_factory=dict)
+    shape: Shape = field(default_factory=Shape)
 
     @property
     def T(self) -> int:
@@ -154,6 +173,7 @@ def build_params(mu: pd.DataFrame, var: pd.DataFrame, R: pd.DataFrame, data_date
 def save_params(p: Params, path) -> None:
     np.savez_compressed(path, isins=np.array(p.isins), dates=p.dates.values.astype("datetime64[D]"),
                         skip=p.skip, drift=p.drift, sd=p.sd, root=p.root, R=p.info["R"], open=p.info["open"],
+                        shape=np.array([p.shape.nu, p.shape.vol_markt, p.shape.vol_aandeel], float),
                         zonder_correlaties=np.array(p.info["zonder_correlaties"], dtype=str))
 
 
@@ -161,7 +181,9 @@ def load_params(path) -> Params:
     z = np.load(path)
     return Params(isins=list(z["isins"]), dates=pd.DatetimeIndex(z["dates"]), skip=int(z["skip"]),
                   drift=z["drift"], sd=z["sd"], root=z["root"],
-                  info={"R": z["R"], "zonder_correlaties": list(z["zonder_correlaties"]), "open": z["open"]})
+                  info={"R": z["R"], "zonder_correlaties": list(z["zonder_correlaties"]), "open": z["open"]},
+                  shape=Shape(int(z["shape"][0]), float(z["shape"][1]), float(z["shape"][2]))
+                  if "shape" in z else Shape())
 
 
 # --------------------------------------------------------------------------- simulatie
@@ -185,40 +207,53 @@ def backend(device: str = DEVICE):
     return "torch", torch.device(dev)
 
 
-def generate(p: Params, n: int, seed: int = 0, chunk: int = 2000, device: str = DEVICE):
+def generate(p: Params, n: int, seed: int = 0, chunk: int = 2000, device: str = DEVICE,
+             shape: Shape | None = None):
     """Levert stukken van (paden, dagen, aandelen): CUMULATIEF log-rendement vanaf de start van de competitie
     (float32). Als numpy-array (ook als de berekening op de GPU gebeurde). Zelfde seed -> zelfde paden op
-    hetzelfde apparaat."""
+    hetzelfde apparaat. shape: vorm van de verdeling (standaard die van p; Shape() = normaal)."""
+    sh = p.shape if shape is None else shape
     kind, dev = backend(device)
     T, N = p.drift.shape
     if kind == "torch":
         torch = _T["torch"]
         g = torch.Generator(device=dev).manual_seed(seed)
+        randn = lambda sz: torch.randn(sz, generator=g, device=dev)
         drift = torch.as_tensor(p.drift, device=dev)
         sd = torch.as_tensor(p.sd, device=dev)
         rootT = torch.as_tensor(p.root.T.copy(), device=dev)
-        done = 0
-        while done < n:
-            k = min(chunk, n - done)
-            z = torch.randn((k, T, N), generator=g, device=dev) @ rootT
-            r = drift + sd * z
-            c = torch.cumsum(r, dim=1)
-            if p.skip:
-                c = c[:, p.skip:, :] - c[:, p.skip - 1:p.skip, :]
-            yield c.cpu().numpy()
-            done += k
+        exp, sqrt, cumsum = torch.exp, torch.sqrt, (lambda x: torch.cumsum(x, dim=1))
+        out = lambda c: c.cpu().numpy()
     else:
         rng = np.random.default_rng(seed)
-        rootT = p.root.T
-        done = 0
-        while done < n:
-            k = min(chunk, n - done)
-            z = rng.standard_normal((k, T, N), dtype=np.float32) @ rootT
-            c = np.cumsum(p.drift + p.sd * z, axis=1)
-            if p.skip:
-                c = c[:, p.skip:, :] - c[:, p.skip - 1:p.skip, :]
-            yield c.astype(np.float32, copy=False)
-            done += k
+        randn = lambda sz: rng.standard_normal(sz, dtype=np.float32)
+        drift, sd, rootT = p.drift, p.sd, p.root.T
+        exp, sqrt, cumsum = np.exp, np.sqrt, (lambda x: np.cumsum(x, axis=1))
+        out = lambda c: c.astype(np.float32, copy=False)
+    done = 0
+    while done < n:
+        k = min(chunk, n - done)
+        z = randn((k, T, N)) @ rootT
+        if sh.nu:                                              # stressdagen: gemeenschappelijke schaal per dag
+            chi = (randn((k, T, sh.nu)) ** 2).sum(-1)
+            z = z * sqrt((sh.nu - 2) / chi)[:, :, None]
+        mult = None
+        if sh.vol_markt > 0:                                   # hele periode wilder/rustiger, voor iedereen
+            s_ = sh.vol_markt
+            mult = exp(s_ * randn((k, 1, 1)) - s_ * s_ / 2)
+        if sh.vol_aandeel > 0:                                 # per aandeel wilder/rustiger
+            s_ = sh.vol_aandeel
+            m2 = exp(s_ * randn((k, 1, N)) - s_ * s_ / 2)
+            mult = m2 if mult is None else mult * m2
+        if mult is not None:
+            z = z * sqrt(mult)
+        c = cumsum(drift + sd * z)
+        if p.skip:
+            c = c[:, p.skip:, :] - c[:, p.skip - 1:p.skip, :]
+        # plafond: een aandeel dat x16 bereikt, blijft daar (hoogste echte 48-daagse stijging 2019-2021: +1201%)
+        c = c.clamp(max=CAP_LOG) if kind == "torch" else np.minimum(c, CAP_LOG)
+        yield out(c)
+        done += k
 
 
 # --------------------------------------------------------------------------- zelftest
@@ -291,6 +326,38 @@ def selftest() -> bool:
         us_days = np.cumsum(open_all, axis=1)[0, -1] - np.cumsum(open_all, axis=1)[0, p.skip - 1]
         check(f"{name}: na overslaan van {p.skip} dagen: variantie tot 22 jan klopt, VS over {us_days} eigen "
               f"dagen, EU over {p.T - p.skip} (afwijking {dv:.1%})", dv < 0.05 and us_days == p.T - p.skip - 2)
+    # vorm: variantie blijft gelijk, staarten en spreiding worden breder
+    for kind in kinds:
+        name = "numpy" if kind == "numpy" else f"PyTorch ({backend(kind)[1]})"
+        base = Params(p.isins, p.dates, 0, p.drift, p.sd, p.root)
+        sims = {}
+        for lab, sh in (("normaal", Shape()), ("vol", Shape(0, 0.4, 0.4)), ("stress", Shape(4, 0, 0)),
+                        ("alles", Shape(5, 0.3, 0.4))):
+            sims[lab] = np.concatenate(list(generate(base, 30000, seed=7, device=kind, shape=sh))).astype(np.float64)
+        e = [j for j, i in enumerate(isins) if i not in us]
+        worst = 0.0
+        for lab in ("vol", "stress", "alles"):
+            for h in (5, 48):
+                v0 = sims["normaal"][:, h - 1, e].var(0)
+                v1 = sims[lab][:, h - 1, e].var(0)
+                worst = max(worst, float(np.median(np.abs(v1 / v0 - 1))))
+        check(f"{name}: vorm laat de variantie gelijk (grootste mediaanafwijking {worst:.1%})", worst < 0.04)
+        def kurt(x):
+            x = x - x.mean(0)
+            return float(np.median((x ** 4).mean(0) / (x ** 2).mean(0) ** 2 - 3))
+        d1 = {lab: kurt(np.diff(sims[lab], axis=1)[:, 10, :][:, e]) for lab in sims}
+        k48 = {lab: kurt(sims[lab][:, 47, e]) for lab in sims}
+        check(f"{name}: stressdagen geven dikke staarten per dag (extra kurtosis {d1['normaal']:+.2f} -> "
+              f"{d1['stress']:+.2f})", d1["stress"] > d1["normaal"] + 1)
+        check(f"{name}: vol-onzekerheid geeft dikke staarten over 48 dagen ({k48['normaal']:+.2f} -> "
+              f"{k48['vol']:+.2f})", k48["vol"] > k48["normaal"] + 0.3)
+        disp = {lab: np.std(sims[lab][:, 47, e].std(1)) / np.mean(sims[lab][:, 47, e].std(1)) for lab in sims}
+        check(f"{name}: spreiding tussen aandelen wisselt meer tussen scenario's (variatie {disp['normaal']:.2f} -> "
+              f"{disp['vol']:.2f})", disp["vol"] > 1.25 * disp["normaal"])
+    # plafond
+    wild = Params(p.isins, p.dates, 0, p.drift * 0 + 0.08, p.sd, p.root)   # sterke stijging: plafond wordt bereikt
+    top = max(float(c.max()) for c in generate(wild, 500, seed=1))
+    check(f"plafond: geen aandeel boven +{MAX_GAIN:.0%} (hoogste {np.expm1(top):+.0%})", top <= CAP_LOG + 1e-6)
     # een ongeldige matrix (negatieve eigenwaarde) wordt hersteld: diagonaal 1, positief
     Rbad = R.to_numpy().copy()
     Rbad[0, 1] = Rbad[1, 0] = -0.99
