@@ -4,3 +4,5 @@ numpy>=1.26
 pyarrow>=14
 matplotlib>=3.8
 requests>=2.31
+scipy>=1.11
+lightgbm>=4.0
