@@ -17,6 +17,11 @@ Kandidaten
                12-maandsmomentum (+), grootte (-), illiquiditeit (+), laatste cijferverrassing (+)
     enet       elastic net op alle kenmerken (ridge/lasso/mengsel gekozen per herschatting) ~45 coefficienten
     boost      gradient boosting (LightGBM) op dezelfde kenmerken                          bomen
+    nn         neuraal netwerk 32-16-8 (ReLU, PyTorch, GPU indien beschikbaar), gewichtsverval gekozen per
+               herschatting, vroeg stoppen op de validatieperiode, gemiddelde van 3 netwerken  gewichten
+
+Gebruik (extra)
+    python ret_models.py nntest          # zelftest netwerk: leert het een bekend verband? GPU of CPU?
 
 Voorbereiding kenmerken
     Per dag omgezet naar rangen tussen -0,5 en +0,5 (alleen de doorsnede van die dag: geen lek).
@@ -58,7 +63,14 @@ MARKET_FEATS = ["vix", "vix_chg_21", "rate_10y", "rate_10y_chg_21", "month", "da
 SPARSE = ["last_surprise", "days_since_earnings", "days_to_earnings", "earnings_move_avg", "log_mcap",
           "short_pct_shares", "days_to_cover", "short_chg"]
 COMPOSITE = {"mom_12_1": +1, "log_mcap": -1, "amihud": +1, "last_surprise": +1}
-MODELS = ["zero", "capm", "composite", "enet", "boost"]
+MODELS = ["zero", "capm", "composite", "enet", "boost", "nn"]
+NN_ALPHAS = [1e-3, 1e-2, 1e-1]          # gewichtsverval (AdamW), gekozen op de validatieperiode
+NN_SEEDS = [0, 1, 2]
+NN_MAX_EPOCHS = int(os.environ.get("BR_NN_EPOCHS", "60"))
+NN_PATIENCE = 5
+NN_BATCH = 4096
+NN_LR = 2e-3
+NN_DEVICE = os.environ.get("BR_NN_DEVICE", "auto")   # auto: GPU als PyTorch er een ziet, anders CPU
 
 
 def log(msg: str) -> None:
@@ -181,14 +193,136 @@ def fit_predict(model: str, P: pd.DataFrame, xcols: list[str], cal: Calendar, h:
         fit_predict.last_info = {"leaves": leaves, "trees": m.best_iteration}
         fit_predict.last_coef = pd.Series(m.feature_importance("gain"), index=xcols)
         return m.predict(X.iloc[pred_rows], num_iteration=m.best_iteration)
+    if model == "nn":
+        Xf = X.iloc[fit_idx].fillna(0.0).to_numpy(np.float32)
+        Xv = X.iloc[val_idx].fillna(0.0).to_numpy(np.float32)
+        Xp = X.iloc[pred_rows].fillna(0.0).to_numpy(np.float32)
+        sd = float(np.std(y[fit_idx])) or 1.0                  # doel schalen: netwerken leren beter rond 1
+        yf, yv = y[fit_idx] / sd, y[val_idx] / sd
+        best_alpha, best_loss, nets = None, np.inf, {}
+        for a in NN_ALPHAS:
+            net, loss = train_net(Xf, yf, Xv, yv, a, NN_SEEDS[0])
+            nets[a] = net
+            if loss < best_loss:
+                best_alpha, best_loss = a, loss
+        ens = [nets[best_alpha]] + [train_net(Xf, yf, Xv, yv, best_alpha, s_)[0] for s_ in NN_SEEDS[1:]]
+        fit_predict.last_info = {"alpha": best_alpha, "val_mse": float(best_loss)}
+        return sd * np.mean([net_predict(n, Xp) for n in ens], axis=0)
     raise ValueError(model)
+
+
+_TORCH = {}
+
+
+def torch_device():
+    """PyTorch pas laden als het netwerk nodig is (de andere modellen hebben het niet nodig)."""
+    if not _TORCH:
+        import torch
+        dev = NN_DEVICE
+        if dev == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        if dev == "cpu":
+            torch.use_deterministic_algorithms(True)            # zelfde invoer -> exact zelfde uitkomst
+        _TORCH.update(torch=torch, device=torch.device(dev))
+        log(f"  netwerk draait op: {dev}" + (f" ({torch.cuda.get_device_name(0)})" if dev == "cuda" else ""))
+    return _TORCH["torch"], _TORCH["device"]
+
+
+def make_net(torch, d: int):
+    nn = torch.nn
+    return nn.Sequential(nn.Linear(d, 32), nn.ReLU(), nn.Linear(32, 16), nn.ReLU(),
+                         nn.Linear(16, 8), nn.ReLU(), nn.Linear(8, 1))
+
+
+def train_net(Xf, yf, Xv, yv, alpha: float, seed: int):
+    """Een netwerk trainen met vroeg stoppen op de VALIDATIEPERIODE (niet op een willekeurige steekproef):
+    na elk tijdperk de validatiefout meten, de beste gewichten bewaren, stoppen na 5 tijdperken zonder winst.
+    Geeft (gewichten op de CPU, beste validatiefout) terug."""
+    torch, dev = torch_device()
+    torch.manual_seed(seed)
+    gen = torch.Generator().manual_seed(seed)                   # volgorde van de minibatches (op de CPU)
+    xf = torch.as_tensor(Xf, device=dev)
+    yt = torch.as_tensor(np.asarray(yf, np.float32), device=dev)
+    xv = torch.as_tensor(Xv, device=dev)
+    yvt = torch.as_tensor(np.asarray(yv, np.float32), device=dev)
+    net = make_net(torch, Xf.shape[1]).to(dev)
+    opt = torch.optim.AdamW(net.parameters(), lr=NN_LR, weight_decay=alpha)
+    n = len(Xf)
+    best, best_loss, bad = None, np.inf, 0
+    for _ in range(NN_MAX_EPOCHS):
+        net.train()
+        perm = torch.randperm(n, generator=gen).to(dev)
+        for i in range(0, n, NN_BATCH):
+            idx = perm[i:i + NN_BATCH]
+            opt.zero_grad(set_to_none=True)
+            loss = torch.mean((net(xf[idx]).squeeze(1) - yt[idx]) ** 2)
+            loss.backward()
+            opt.step()
+        net.eval()
+        with torch.no_grad():
+            vl = float(torch.mean((net(xv).squeeze(1) - yvt) ** 2))
+        if vl < best_loss - 1e-6:
+            best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            best_loss, bad = vl, 0
+        else:
+            bad += 1
+            if bad >= NN_PATIENCE:
+                break
+    if best is None:
+        best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+    return (Xf.shape[1], best), best_loss
+
+
+def net_predict(saved, Xp) -> np.ndarray:
+    torch, dev = torch_device()
+    d, state = saved
+    net = make_net(torch, d).to(dev)
+    net.load_state_dict(state)
+    net.eval()
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(Xp), 65536):
+            out.append(net(torch.as_tensor(Xp[i:i + 65536], device=dev)).squeeze(1).cpu().numpy())
+    return np.concatenate(out).astype(np.float64) if out else np.zeros(0)
+
+
+def nn_selftest() -> None:
+    """Kan het netwerk een bekend NIET-lineair verband leren dat een lineair model mist? En geeft dezelfde
+    invoer (op de CPU) exact dezelfde uitkomst?"""
+    import time
+    rng = np.random.default_rng(0)
+    n, d = 60000, 12
+    X = rng.uniform(-0.5, 0.5, (n, d)).astype(np.float32)
+    signal = np.sin(6 * X[:, 0]) + 4 * X[:, 1] * X[:, 2] + 2 * X[:, 3]
+    y = signal + rng.normal(0, 0.5, n)
+    f, v, p = slice(0, 40000), slice(40000, 50000), slice(50000, n)
+    t0 = time.time()
+    saved, _ = train_net(X[f], y[f], X[v], y[v], 1e-2, 0)
+    pred = net_predict(saved, X[p])
+    secs = time.time() - t0
+    def r2(a): return 1 - np.mean((y[p] - a) ** 2) / np.var(y[p])
+    A = np.c_[np.ones(40000), X[f]]
+    lin = np.c_[np.ones(n - 50000), X[p]] @ np.linalg.lstsq(A, y[f], rcond=None)[0]
+    best = r2(signal[p])
+    print(f"R2 op nieuwe data: netwerk {r2(pred):.3f} | lineair {r2(lin):.3f} | maximaal haalbaar {best:.3f}"
+          f"   ({secs:.1f} s)")
+    ok1 = r2(pred) > r2(lin) + 0.05 and r2(pred) > best - 0.08
+    print(f"  {'OK ' if ok1 else 'FOUT'} netwerk leert het niet-lineaire verband")
+    global NN_DEVICE
+    NN_DEVICE = "cpu"
+    _TORCH.clear()
+    a = net_predict(train_net(X[f][:8000], y[f][:8000], X[v], y[v], 1e-2, 1)[0], X[p])
+    b = net_predict(train_net(X[f][:8000], y[f][:8000], X[v], y[v], 1e-2, 1)[0], X[p])
+    ok2 = np.array_equal(a, b)
+    print(f"  {'OK ' if ok2 else 'FOUT'} zelfde invoer en startpunt -> exact dezelfde voorspelling (CPU)")
+    print("ZELFTEST GESLAAGD" if ok1 and ok2 else "ZELFTEST MISLUKT")
 
 
 def walk_forward(model: str, P: pd.DataFrame, xcols: list[str], start: pd.Timestamp, end: pd.Timestamp,
                  verbose: bool = True, horizons: list[int] | None = None) -> pd.DataFrame:
     cal = Calendar(P["date"])
     rng = np.random.default_rng(0)
-    freq = "6MS" if model == "boost" else "QS"
+    freq = "6MS" if model in ("boost", "nn") else "QS"
     refits = pd.date_range(start.to_period("Q").start_time, end, freq=freq)
     out = P[["date", "isin"]].copy()
     info = []
@@ -204,7 +338,7 @@ def walk_forward(model: str, P: pd.DataFrame, xcols: list[str], start: pd.Timest
                 continue
             train = cal.rows_upto(k_cut)
             pred[rows] = fit_predict(model, P, xcols, cal, h, train, rows, rng)
-            if model in ("enet", "boost"):
+            if model in ("enet", "boost", "nn"):
                 info.append({"model": model, "h": h, "herschatting": r0.date(), **getattr(fit_predict, "last_info", {})})
         out[f"p_{h}"] = pred
         if verbose:
@@ -219,6 +353,9 @@ def walk_forward(model: str, P: pd.DataFrame, xcols: list[str], start: pd.Timest
 
 
 def main():
+    if sys.argv[1:] == ["nntest"]:
+        nn_selftest()
+        return
     which = [m for m in sys.argv[1:] if m in MODELS] or MODELS
     log("Paneel laden (kenmerken per dag rangschikken) ...")
     P, xcols = load_panel()

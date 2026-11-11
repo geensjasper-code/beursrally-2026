@@ -7,3 +7,4 @@ requests>=2.31
 scipy>=1.11
 lightgbm>=4.0
 scikit-learn>=1.7
+# torch apart installeren (GPU-versie):  pip install torch --index-url https://download.pytorch.org/whl/cu132

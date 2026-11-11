@@ -9,7 +9,7 @@ Gebruik
 Idee
     Verander de toekomst na een datum D: alle kenmerken van dagen na D, en elk doel y_h waarvan het venster
     (dag t+1 tot t+h) voorbij D loopt. Voorspellingen voor dagen t <= D mogen daardoor NIET veranderen.
-    Getest: composite (schaal geschat op het verleden), elastic net en boosting, h = 5 en 20.
+    Getest: composite (schaal geschat op het verleden), elastic net, boosting en het neurale netwerk, h = 5 en 20.
 
 Eerst een herhaalbaarheidscontrole: hetzelfde model twee keer op IDENTIEKE data moet exact hetzelfde geven.
     Alles draait op een rekendraad, zodat afrondingsverschillen tussen draden geen rol spelen.
@@ -30,6 +30,8 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
     os.environ[_v] = "1"
 os.environ.setdefault("BR_RET_ROWS", "60000")
 os.environ.setdefault("BR_RET_ROUNDS", "60")
+os.environ.setdefault("BR_NN_EPOCHS", "8")
+os.environ.setdefault("BR_NN_DEVICE", "cpu")   # lektest bit-voor-bit: GPU-berekeningen zijn niet exact herhaalbaar
 
 import numpy as np
 import pandas as pd
@@ -106,13 +108,13 @@ def main():
         F2, T2 = tamper(F, T, D, rng)
         P2, x2 = load_panel(F2, T2)
         P1b, _ = load_panel(F.copy(), T.copy())
-        for model in ("enet", "boost"):
+        for model in ("enet", "boost", "nn"):
             a = walk_forward(model, P1, x1, start, end, verbose=False, horizons=HS)
             b = walk_forward(model, P1b, x1, start, end, verbose=False, horizons=HS)
             for h in HS:
                 ok, n = compare(a, b, pd.Timestamp("2100-01-01"), h)
                 allok &= check(f"herhaalbaar: {model} h = {h} twee keer identiek ({n:,} vergeleken)", ok and n > 0)
-        for model in ("composite", "enet", "boost"):
+        for model in ("composite", "enet", "boost", "nn"):
             a = walk_forward(model, P1, x1, start, end, verbose=False, horizons=HS)
             b = walk_forward(model, P2, x2, start, end, verbose=False, horizons=HS)
             for h in HS:

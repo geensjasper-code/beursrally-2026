@@ -6,7 +6,9 @@ Voorspelt per aandeel het AANDEELSPECIFIEKE rendement (beter of slechter dan het
 ## Eenmalig
 
 ```
-python ret_models.py      # walk-forward voor zero, capm, composite, enet, boost (enkele minuten)
+pip install torch --index-url https://download.pytorch.org/whl/cu132   # PyTorch met GPU (driver met CUDA 13)
+python ret_models.py nntest   # zelftest netwerk (GPU of CPU, leert het een bekend verband?)
+python ret_models.py      # walk-forward voor zero, capm, composite, enet, boost, nn (nn: GPU indien beschikbaar)
 python ret_compare.py     # vergelijking 2019-2021, keuze per horizon, w, b, kostentoets
 python ret_build.py       # verwacht rendement vandaag
 python ret_test.py        # lektest
@@ -22,7 +24,7 @@ python ret_build.py
 
 | Onderdeel | Keuze |
 |---|---|
-| Kandidaten | alles gelijk, CAPM, academische samenstelling, elastic net, gradient boosting |
+| Kandidaten | alles gelijk, CAPM, academische samenstelling, elastic net, gradient boosting, neuraal netwerk (32-16-8, ensemble van 3) |
 | Kenmerken | per dag gerangschikt (-0,5 tot +0,5); marktbrede kenmerken niet gebruikt |
 | Toets | walk-forward met embargo (h + 5 dagen); kiezen op 2019-2021 |
 | Hoofdmaatstaf | rang-IC (t-waarde met Newey-West) |
