@@ -1,9 +1,7 @@
 # Beursrally 2026
 
 
-About this project. This is my first fully independent project of this scale. It is vibe coded: the code was written with an AI coding assistant. I set the goal, the constraints and the validation rules, ran and checked every step, and made the design decisions. The accompanying paper explains and defends each part.
-
-
+About this project. This is my first fully independent project of this scale, built with AI-assisted development. I defined the objective, the constraints and the validation protocol, made the modelling and design decisions, and ran, tested and reviewed every stage; an AI coding assistant wrote most of the implementation. The accompanying paper explains and defends each part.
 A quantitative strategy for **Beursrally 2026**, the virtual stock-market competition of the Belgian newspaper
 De Tijd (about 10,000–35,000 players, €50,000 virtual starting capital, prizes for the top 3 of the general
 ranking and of the student ranking).
