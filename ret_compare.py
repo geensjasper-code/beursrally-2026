@@ -4,7 +4,8 @@ Beursrally 2026 - rendementsmodel: alle kandidaten vergelijken en kiezen.
 
 Gebruik
     python ret_compare.py           # keuzeperiode 2019-2021: hiermee kiezen we
-    python ret_compare.py --final   # OOK de testperiode 2022-2026 (een keer, aan het einde)
+    python ret_compare.py --controle   # ook de controleperiode 2022 - midden 2025 (bescheiden bijsturen mag)
+    python ret_compare.py --final      # ook de eindtoets midden 2025 - nu (een keer, aan het einde)
 
 Maatstaven (per model en horizon, op exact dezelfde rijen)
     IC        rang-IC: correlatie tussen voorspelde en gerealiseerde rangorde per dag, gemiddeld
@@ -38,6 +39,21 @@ import pandas as pd
 from ret_models import FEAT, HORIZONS, MODELS, OUT, log
 
 EVAL_START, SPLIT = pd.Timestamp("2019-01-01"), pd.Timestamp("2022-01-01")
+CONTROLE_END = pd.Timestamp("2025-07-01")
+
+
+def _mask(d, period):
+    if period == "keuze":
+        return (d >= EVAL_START) & (d < SPLIT)
+    if period == "controle":
+        return (d >= SPLIT) & (d < CONTROLE_END)
+    if period == "final":
+        return d >= CONTROLE_END
+    if period == "samen":
+        return (d >= EVAL_START) & (d < CONTROLE_END)
+    if period == "alles":
+        return d >= EVAL_START
+    return d >= SPLIT
 COST_ROUND_TRIP = 2 * (5.0 / 5000 + 0.0035)          # 0,9%
 Z_TOP10 = 2.2
 
@@ -88,7 +104,7 @@ def add_combo(M: pd.DataFrame, a: str, b: str, h: int, scale: float | None = Non
 
 def ic_diff_t(M: pd.DataFrame, a: str, b: str, h: int, period: str) -> float:
     d = M["date"]
-    sub = M[((d >= EVAL_START) & (d < SPLIT)) if period == "keuze" else (d >= SPLIT)]
+    sub = M[_mask(d, period)]
     sub = sub.dropna(subset=[f"{a}|{h}", f"{b}|{h}", f"yd_{h}"])
     ia = per_date_ic(sub.assign(_p=sub[f"{a}|{h}"]), "_p", f"yd_{h}")
     ib = per_date_ic(sub.assign(_p=sub[f"{b}|{h}"]), "_p", f"yd_{h}")
@@ -111,7 +127,7 @@ def load(models):
 
 def evaluate(M: pd.DataFrame, models: list[str], h: int, period: str) -> pd.DataFrame:
     d = M["date"]
-    sub = M[((d >= EVAL_START) & (d < SPLIT)) if period == "keuze" else (d >= SPLIT)]
+    sub = M[_mask(d, period)]
     cols = [f"{m}|{h}" for m in models]
     sub = sub.dropna(subset=cols + [f"yd_{h}"])
     y = sub[f"yd_{h}"]
@@ -144,7 +160,10 @@ def evaluate(M: pd.DataFrame, models: list[str], h: int, period: str) -> pd.Data
 
 
 def main():
-    final = "--final" in sys.argv
+    alles = "--alles" in sys.argv                  # na de eindtoets: w en b over 2019 - nu (zelfde regel, alle data)
+    final = "--final" in sys.argv or alles
+    controle = "--controle" in sys.argv or final
+    write_from = "alles" if alles else "samen"
     models = [m for m in MODELS if (OUT / f"pred_{m}.parquet").exists()]
     if not models:
         sys.exit("Geen voorspellingen gevonden. Eerst:  python ret_models.py")
@@ -152,8 +171,14 @@ def main():
     M = load(models)
     pd.set_option("display.width", 220)
     keuze = {}
-    for period in (["keuze", "test"] if final else ["keuze"]):
-        title = "KEUZEPERIODE 2019-2021" if period == "keuze" else "TESTPERIODE 2022-2026 (eenmalig!)"
+    later = {}
+    for period in ["keuze"] + (["controle", "samen"] if controle else []) + (["final"] if final else []) \
+            + (["alles"] if alles else []):
+        title = {"keuze": "KEUZEPERIODE 2019-2021", "controle": "CONTROLEPERIODE 2022 - MIDDEN 2025",
+                 "samen": "KEUZE + CONTROLE SAMEN: 2019 - MIDDEN 2025"
+                          + ("" if alles else " (hieruit komen w en b)"),
+                 "final": "EINDTOETS MIDDEN 2025 - NU (eenmalig!)",
+                 "alles": "ALLES: 2019 - NU (na de eindtoets; hieruit komen w en b)"}[period]
         print(f"\n================ RENDEMENTSMODEL: {title} ================")
         print("IC = rang-IC (correlatie voorspelde en echte rangorde). t_IC > 2: overtuigend. "
               "t_DM < -2: overtuigend beter dan 'alles gelijk'.")
@@ -170,7 +195,7 @@ def main():
                     note = f"  IC-verschil {m1} - {m2}: t = {td:.2f} (niet significant) -> gemiddelde van beide"
                 else:
                     note = f"  IC-verschil {m1} - {m2}: t = {td:.2f} (significant) -> {m1}"
-            elif period == "test" and str(h) in keuze and keuze[str(h)]["model"].startswith("gem:"):
+            elif period != "keuze" and str(h) in keuze and keuze[str(h)]["model"].startswith("gem:"):
                 a_, b_ = keuze[str(h)]["model"][4:].split("+")
                 combo, scale = add_combo(M, a_, b_, h, keuze[str(h)]["schaal"])
             if combo:
@@ -186,7 +211,7 @@ def main():
             cand = res.drop(index="zero", errors="ignore").dropna(subset=["IC"])
             if combo:
                 best = combo
-            elif period == "test" and str(h) in keuze:
+            elif period != "keuze" and str(h) in keuze:
                 best = keuze[str(h)]["model"]
             else:
                 best = cand["IC"].idxmax() if not cand.empty else "zero"
@@ -200,6 +225,9 @@ def main():
             ic_best = float(cand.at[best, "IC"]) if best != "zero" else 0.0
             verdict = "boven IC_min" if ic_best > a["ic_min"] else "ONDER IC_min (handelen loont gemiddeld niet)"
             print(f"  -> beste: {best} (IC {ic_best:.4f}, t {t:.2f}); vertrouwen w = {w:.2f}; {verdict}")
+            if period != "keuze":
+                later.setdefault(period, {})[h] = {"model": best, "IC": ic_best, "t_IC": t, "w": w,
+                                                   "b": float(cand.at[best, "b"]) if best != "zero" else 0.0}
             if period == "keuze":
                 keuze[str(h)] = {"model": best, "schaal": float(scale) if combo else 1.0, "IC": ic_best, "t_IC": t, "w": w,
                                  "b": float(cand.at[best, "b"]) if best != "zero" else 0.0,
@@ -213,8 +241,34 @@ def main():
     print(kt.round({"IC": 4, "t_IC": 2, "w": 2, "b": 2, "IC_min": 3}).to_string())
     print("Gebruikt rendement = 7%/jaar x h/252  +  w x b x voorspelling.")
     print("==================================================================\n")
+    for period, d in later.items():
+        print(f"================ {period.upper()}: GEKOZEN MODELLEN BUITEN DE KEUZEPERIODE ================")
+        rows = []
+        adv = {}
+        for h, v in d.items():
+            k = keuze[str(h)]
+            if v["t_IC"] < 2 or v["IC"] <= 0:
+                adv[str(h)] = {"w": 0.0, "b": float(k["b"])}
+                advies = "w = 0 (alleen marktdeel)"
+            else:
+                adv[str(h)] = {"w": float(v["w"]), "b": float(v["b"])}
+                advies = f"w = {v['w']:.2f}, b = {v['b']:.2f}"
+            rows.append({"h": h, "model": v["model"], "IC keuze": round(k["IC"], 4), "IC hier": round(v["IC"], 4),
+                         "t_IC hier": round(v["t_IC"], 2), "b hier": round(v["b"], 2),
+                         "w keuze": round(k["w"], 2), "gevolg": advies})
+        print(pd.DataFrame(rows).set_index("h").to_string())
+        if period == write_from:
+            (OUT / "w_controle.json").write_text(json.dumps(adv, indent=2))
+            span = "2019 - nu" if alles else "2019 - midden 2025"
+            print(f"-> data/returns/w_controle.json: ret_build.py gebruikt w en b uit {span} "
+                  "(bestand weg = keuzeperiode)")
+            print("Regel (optie C): vertrouwen gemeten over de hele periode voor de eindtoets; niet significant "
+                  "(t < 2) of IC <= 0 -> w = 0.\n")
+        else:
+            print("(Alleen ter informatie; w en b komen uit de periode "
+                  f"{'2019 - nu' if alles else '2019 - midden 2025 samen'}.)\n")
     if not final:
-        print("De testperiode 2022-2026 is NIET bekeken. Dat doen we een keer, als alles af is.\n")
+        print("De eindtoets (midden 2025 - nu) is NIET bekeken. Dat doen we een keer, als alles vastligt.\n")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,8 @@ Afspraken
                          RV_h(d) = r_{d+1}^2 + ... + r_{d+h}^2   (log-rendementen in euro, uit data/clean)
     Voorspelling         v_h(d) = verwachte RV_h(d), in dezelfde eenheid (dagvariantie x h).
     Periodes             voorspellingen vanaf FC_START; keuzeperiode EVAL_START..SPLIT;
-                         testperiode vanaf SPLIT (alleen bekijken met risk_compare.py --final).
+                         controleperiode SPLIT..CONTROLE_END (--controle: kijken en waar nodig bescheiden bijsturen);
+                         eindtoets vanaf CONTROLE_END (--final: een keer, daarna niets meer aanpassen).
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ HORIZONS = [1, 3, 5, 10, 20, 48]
 FC_START = pd.Timestamp("2018-07-01")     # eerste voorspellingen (modellen hebben ~1,5 jaar opwarmtijd)
 EVAL_START = pd.Timestamp("2019-01-01")   # begin keuzeperiode
 SPLIT = pd.Timestamp("2022-01-01")        # begin testperiode
+CONTROLE_END = pd.Timestamp("2025-07-01")  # testperiode in twee: controle 2022 - midden 2025, eindtoets daarna
 FLOOR = 1e-10                             # ondergrens voor RV = 0 (koers onveranderd) in QLIKE
 LOGC = 1e-6                               # kleine constante in ln(variantie + c) voor HAR
 
@@ -159,6 +161,10 @@ def period_mask(dates: pd.Series, period: str) -> pd.Series:
         return (dates >= EVAL_START) & (dates < SPLIT)
     if period == "test":
         return dates >= SPLIT
+    if period == "controle":
+        return (dates >= SPLIT) & (dates < CONTROLE_END)
+    if period == "final":
+        return dates >= CONTROLE_END
     raise ValueError(period)
 
 

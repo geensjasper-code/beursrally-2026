@@ -4,7 +4,8 @@ Beursrally 2026 - risicomodel: alle volatiliteitsmodellen vergelijken.
 
 Gebruik
     python risk_compare.py           # keuzeperiode 2019-2021: hiermee kiezen we
-    python risk_compare.py --final   # OOK de testperiode 2022-2026. Een keer, aan het einde!
+    python risk_compare.py --controle   # ook de controleperiode 2022 - midden 2025 (bescheiden bijsturen mag)
+    python risk_compare.py --final      # ook de eindtoets midden 2025 - nu. Een keer, aan het einde!
 
 Leest alle voorspellingen in data/risk/forecasts/ en beoordeelt ze op EXACT dezelfde rijen
 (datum x aandeel waarvoor elk model een voorspelling heeft en het doel bekend is).
@@ -106,6 +107,7 @@ def sanity(models: list[str]) -> pd.DataFrame:
 
 def main():
     final = "--final" in sys.argv
+    controle = "--controle" in sys.argv or final
     models = available_forecasts()
     if BASELINE not in models:
         sys.exit("Eerst:  python risk_simple.py  (EWMA 0,94 is de maatstaf)")
@@ -118,11 +120,12 @@ def main():
             for h in HORIZONS:
                 M[f"{name}|{h}"] = (M[f"har|{h}"] + M[f"{other}|{h}"]) / 2
             models.append(name)
-    periods = ["keuze", "test"] if final else ["keuze"]
+    periods = ["keuze"] + (["controle"] if controle else []) + (["final"] if final else [])
     pd.set_option("display.width", 200)
     summary = []
     for period in periods:
-        label = "KEUZEPERIODE 2019-2021" if period == "keuze" else "TESTPERIODE 2022-2026 (eenmalig!)"
+        label = {"keuze": "KEUZEPERIODE 2019-2021", "controle": "CONTROLEPERIODE 2022 - MIDDEN 2025",
+                 "final": "EINDTOETS MIDDEN 2025 - NU (eenmalig!)"}[period]
         print(f"\n================ VOLATILITEIT: {label} ================")
         print("Alle modellen op exact dezelfde rijen. QLIKE lager = beter. t_DM < -2: overtuigend beter dan EWMA 0,94.")
         for h in HORIZONS:
@@ -144,7 +147,8 @@ def main():
                 print("Dagen buiten 2 sigma (normaal 4,6%, met dikke staarten 5-7%): "
                       + ", ".join(f"{m} {v:.1%}" for m, v in tc.items()))
     sm = pd.DataFrame(summary)
-    sm.to_csv(RISK / ("vergelijking_final.csv" if final else "vergelijking_keuze.csv"), index=False)
+    sm.to_csv(RISK / ("vergelijking_final.csv" if final else "vergelijking_controle.csv" if controle
+                      else "vergelijking_keuze.csv"), index=False)
     print("\n================ WINNAAR PER HORIZON ================")
     print("Bij meerdere namen: niet significant verschillend van de beste en QLIKE binnen 2% -> we middelen ze.")
     print(sm.to_string(index=False))
@@ -157,8 +161,11 @@ def main():
         print(sn.to_string(index=False))
         print("Verwacht ruwweg: KBC/Ageas 15-30%, ASML 30-45%, Nvidia 40-60%, IonQ 70-120%.")
     print("=============================================================================================\n")
+    if controle:
+        print("Terugvalregel: zijn HAR/boosting in een latere periode NIET beter dan EWMA 0,94 (t_DM > -2) of ligt de\n"
+              "bias ver van 1 (onder 0,7 of boven 1,4), dan valt die horizon terug op EWMA 0,94.\n")
     if not final:
-        print("De testperiode 2022-2026 is NIET bekeken. Dat doen we een keer, als alle modellen af zijn.\n")
+        print("De eindtoets (midden 2025 - nu) is NIET bekeken. Dat doen we een keer, als alles vastligt.\n")
 
 
 if __name__ == "__main__":

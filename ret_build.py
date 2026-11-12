@@ -26,6 +26,17 @@ from ret_models import DATA, HORIZONS, MARKET_PA, OUT, Calendar, fit_predict, lo
 
 def main():
     keuze = json.loads((OUT / "keuze.json").read_text())
+    f_w = OUT / "w_controle.json"
+    if f_w.exists():                                   # w en b over 2019 - midden 2025 (ret_compare --controle)
+        w_c = json.loads(f_w.read_text())
+        for h, v in w_c.items():
+            if h in keuze:
+                if isinstance(v, dict):
+                    keuze[h]["w"], keuze[h]["b"] = float(v["w"]), float(v["b"])
+                else:
+                    keuze[h]["w"] = min(float(keuze[h]["w"]), float(v))
+        log("w en b over 2019 - midden 2025: " + ", ".join(f"h={h}: w {keuze[h]['w']:.2f} b {keuze[h]['b']:.2f}"
+                                                          for h in w_c if h in keuze))
     log("Paneel laden ...")
     P, xcols = load_panel()
     cal = Calendar(P["date"])

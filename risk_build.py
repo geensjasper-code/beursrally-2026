@@ -29,7 +29,8 @@ import numpy as np
 import pandas as pd
 
 from risk_common import HORIZONS, PROC, RISK, load_forecast, load_returns, log, names
-from risk_corr import WINDOW, cluster, corr_factor, corr_lw, corr_resid, corr_sample, two_day_returns, window_matrix
+from risk_corr import (WINDOW, cluster, corr_factor, corr_factor_extended, corr_lw, corr_resid, corr_sample,
+                       two_day_returns, window_matrix)
 from risk_iv import atm_iv, fx_adjustment, iv_term
 
 LAMBDA_DEFAULT = 0.7
@@ -133,16 +134,24 @@ def main():
     # 4. correlaties en thema's van vandaag
     best = (RISK / "corr_keuze.txt").read_text().strip() if (RISK / "corr_keuze.txt").exists() else "lw"
     lr = load_returns()
-    W = window_matrix(two_day_returns(lr), last_date + pd.Timedelta(days=1))
+    r2 = two_day_returns(lr)
+    end = last_date + pd.Timedelta(days=1)
+    W = window_matrix(r2, end)
     W = W.loc[:, W.columns.isin(vol.index)]
     X = W.to_numpy()
-    if best == "sample":
-        R = corr_sample(X)
-    elif best.startswith("fac_"):
-        R = corr_factor(X, int(best.split("_")[1]))
+    if best.startswith("fac_"):
+        # recente beursgangen (te kort voor het venster): ladingen schatten op de dagen dat ze noteren
+        recent = [i for i in vol.index if i not in W.columns and i in r2.columns]
+        raw = r2[r2.index < end].tail(len(W)).reindex(W.index)[recent]
+        Rdf, est, short = corr_factor_extended(W, raw, int(best.split("_")[1]))
+        if est:
+            log(f"Correlaties geschat voor {len(est)} recente beursgang(en): " + ", ".join(nm.get(i, i) for i in est))
+        if short:
+            log(f"Te korte historiek (< 60 beursdagen), aanname in scen_core: " + ", ".join(nm.get(i, i) for i in short))
+        Rdf.to_parquet(RISK / "corr_vandaag.parquet")
     else:
-        R = corr_lw(X)[0]
-    pd.DataFrame(R, index=W.columns, columns=W.columns).to_parquet(RISK / "corr_vandaag.parquet")
+        R = corr_sample(X) if best == "sample" else corr_lw(X)[0]
+        pd.DataFrame(R, index=W.columns, columns=W.columns).to_parquet(RISK / "corr_vandaag.parquet")
     st = RISK / "themas_stabiliteit.csv"
     nr, K = (1, 15)
     if st.exists():

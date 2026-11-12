@@ -5,7 +5,8 @@ Beursrally 2026 - scenariogenerator (stap 4c): klopt de simulatie met wat er ech
 Gebruik
     python scen_backtest.py            # keuzeperiode 2019-2021 met de gekozen vorm (of normaal)
     python scen_backtest.py --grid     # keuzeperiode: alle vormen van het rooster, beste bewaren
-    python scen_backtest.py --final    # testperiode 2022-2026: EEN keer, als alles af is
+    python scen_backtest.py --controle # controleperiode 2022 - midden 2025 (bescheiden bijsturen mag)
+    python scen_backtest.py --final    # eindtoets midden 2025 - nu: EEN keer, als alles af is
 
 Vormen (scen_core.Shape): stressdagen (nu), vol-onzekerheid voor de hele markt en per aandeel.
 Keuze: laagste afwijking van de staartpercentages (gewogen naar hoeveel onafhankelijke waarnemingen een
@@ -49,13 +50,15 @@ from scen_core import Shape, build_params, generate, trading_days
 HERE = Path(__file__).resolve().parent
 RET = HERE / "data" / "returns"
 FEAT = HERE / "data" / "features"
-COMBO_H = [1, 3, 5, 10]                      # zoals risk_build.py: HAR + boost_alleen gemiddeld
+COMBO_H = [1, 3, 5, 10, 20, 48]              # zoals risk_build.py: HAR + boost_alleen gemiddeld
 TEST_H = [5, 20, 48]
 N_SCEN = int(os.environ.get("BR_BT_SCEN", "2000"))
 N_RANDOM_PORT = 300
 MARKET_PA = 0.07
 KEUZE = (pd.Timestamp("2019-01-01"), pd.Timestamp("2022-01-01"))
 TEST = (pd.Timestamp("2022-01-01"), pd.Timestamp("2100-01-01"))
+CONTROLE = (pd.Timestamp("2022-01-01"), pd.Timestamp("2025-07-01"))
+FINAL = (pd.Timestamp("2025-07-01"), pd.Timestamp("2100-01-01"))
 GRID = [Shape(nu, vm, va) for nu in (0, 5) for vm in (0.0, 0.25, 0.5, 0.75) for va in (0.0, 0.25, 0.5, 0.75, 1.0)]
 SHAPE_FILE = HERE / "data" / "scenarios" / "vorm_keuze.json"
 BANDS = [("<1%", 0.01), ("<5%", 0.05), ("<10%", 0.10), (">90%", 0.10), (">95%", 0.05), (">99%", 0.01)]
@@ -136,6 +139,8 @@ def pit(sim: np.ndarray, real: np.ndarray) -> np.ndarray:
 
 def prepare(hist: History, D: pd.Timestamp):
     mu, var, R, y = hist.inputs(D)
+    if len(var) < 50:                         # te weinig aandelen met een afgelopen doel (recente datums)
+        raise KeyError(f"{D.date()}: te weinig aandelen")
     p = build_params(mu, var, R, D, end=D + pd.Timedelta(days=110))
     return p, var, y
 
@@ -249,7 +254,13 @@ def report(res: list[dict], label: str, n_scen: int = N_SCEN) -> None:
           + f"{real_best.max():+8.0%}")
     print("  simulatie                                    " + "".join(f"{v:+8.0%}" for v in np.quantile(sim_best, qs))
           + f"{np.quantile(sim_best, 0.999):+8.0%} (p99,9)")
-    print("  Simulatie p90 duidelijk boven echt p90: de extremen zijn te wild -> voorzichtiger vorm kiezen.")
+    s90, r90 = np.quantile(sim_best, 0.9), np.quantile(real_best, 0.9)
+    if s90 > r90 * 1.3 + 0.2:
+        print("  LET OP: simulatie p90 duidelijk boven echt p90: de extremen zijn te wild -> voorzichtiger vorm kiezen.")
+    elif s90 < r90 / 1.3 - 0.2:
+        print("  Simulatie duidelijk voorzichtiger dan de werkelijkheid voor het beste aandeel.")
+    else:
+        print("  Simulatie en werkelijkheid liggen voor het beste aandeel in dezelfde orde.")
     print(f"Afwijking (lager = beter): {loss(t, len(res)):.0f}")
     print("=" * 100)
 
@@ -263,12 +274,13 @@ def load_shape() -> Shape:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--final", action="store_true", help="testperiode 2022-2026 (een keer, aan het einde)")
+    ap.add_argument("--final", action="store_true", help="eindtoets midden 2025 - nu (een keer, aan het einde)")
+    ap.add_argument("--controle", action="store_true", help="controleperiode 2022 - midden 2025")
     ap.add_argument("--grid", action="store_true", help="alle vormen van het rooster vergelijken (keuzeperiode)")
     a = ap.parse_args()
-    if a.grid and a.final:
+    if a.grid and (a.final or a.controle):
         sys.exit("--grid alleen op de keuzeperiode.")
-    lo, hi = TEST if a.final else KEUZE
+    lo, hi = FINAL if a.final else CONTROLE if a.controle else KEUZE
     log("Historiek laden (voorspellingen risico en rendement, rendementen) ...")
     hist = History()
     d = pd.Series(hist.dates)
@@ -285,13 +297,20 @@ def main():
     if not preps:
         sys.exit("Geen bruikbare startdatums.")
     log(f"{len(preps)} startdatums voorbereid")
-    period = "TESTPERIODE 2022-2026" if a.final else "KEUZEPERIODE 2019-2021"
+    period = ("EINDTOETS MIDDEN 2025 - NU" if a.final else "CONTROLEPERIODE 2022 - MIDDEN 2025" if a.controle
+              else "KEUZEPERIODE 2019-2021")
     if not a.grid:
         shape = load_shape()
         t0 = time.time()
         res = [one_date(pr, D, shape, N_SCEN, k) for k, (D, pr) in enumerate(preps.items())]
         log(f"Gesimuleerd in {time.time() - t0:.0f} s")
         report(res, f"{period}, vorm: {shape.label()}")
+        if a.controle or a.final:
+            res0 = [one_date(pr, D, Shape(), N_SCEN, k) for k, (D, pr) in enumerate(preps.items())]
+            print(f"Ter vergelijking, normale vorm in dezelfde periode: afwijking {loss(tail_table(res0), len(res0)):.0f} "
+                  f"(gekozen vorm: {loss(tail_table(res), len(res)):.0f}; keuzeperiode: 64 tegenover 420).")
+            print("Terugvalregel: is de gekozen vorm hier NIET beter dan normaal, of duidelijk te wild (beste aandeel\n"
+                  "simulatie p90 ver boven echt p90), dan een voorzichtiger punt uit het rooster (bv. 0.50/0.50).")
         return
     n_grid = int(os.environ.get("BR_BT_GRID_SCEN", "1000"))
     scores, results = {}, {}

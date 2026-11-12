@@ -111,6 +111,91 @@ def corr_factor(X: np.ndarray, k: int) -> np.ndarray:
     return R
 
 
+RECENT_MIN_OBS = 30               # recente beursgang: minstens 30 tweedaagse rendementen (~60 beursdagen)
+RECENT_SHRINK = 60                # krimp naar de gemiddelde lading: gewicht eigen schatting = n / (n + 60)
+
+
+def corr_factor_extended(W: pd.DataFrame, Wraw_recent: pd.DataFrame, k: int) -> tuple[pd.DataFrame, list, list]:
+    """Factormodel (zoals corr_factor) voor de aandelen met volledige historiek, UITGEBREID met recente
+    beursgangen: hun ladingen op de k factoren worden geschat met een regressie van hun (gestandaardiseerde)
+    tweedaagse rendementen op de factorrendementen, over de dagen dat ze noteren. Korte historiek = ruis:
+    de schatting wordt gekrompen naar de gemiddelde lading (gewicht n / (n + 60)).
+    Geeft (R als DataFrame, geschatte recente isins, te korte isins)."""
+    X = W.to_numpy()
+    Z = standardize(X)
+    S = Z.T @ Z / len(Z)
+    val, vec = np.linalg.eigh(S)
+    idx = np.argsort(val)[::-1][:k]
+    lam = np.maximum(val[idx], 1e-12)
+    V = vec[:, idx]
+    B = V * np.sqrt(lam)                                       # ladingen bestaande aandelen (N, k)
+    F = Z @ V / np.sqrt(lam)                                   # factorrendementen (T, k), variantie ~1
+    b_avg = B.mean(0) * 0.8
+    new, short, loads = [], [], []
+    for c in Wraw_recent.columns:
+        r = Wraw_recent[c].to_numpy(float)
+        ok = np.isfinite(r)
+        n = int(ok.sum())
+        if n < RECENT_MIN_OBS:
+            short.append(c)
+            continue
+        z = (r[ok] - r[ok].mean()) / (r[ok].std() or 1.0)
+        b, *_ = np.linalg.lstsq(F[ok], z, rcond=None)
+        w = n / (n + RECENT_SHRINK)
+        b = w * b + (1 - w) * b_avg
+        comm = float(b @ b)
+        if comm > 0.95:                                        # gemeenschappelijk deel hoogstens 95%
+            b *= np.sqrt(0.95 / comm)
+        new.append(c)
+        loads.append(b)
+    L = np.vstack([B] + ([np.array(loads)] if loads else []))
+    R = L @ L.T
+    np.fill_diagonal(R, 1.0)
+    cols = list(W.columns) + new
+    return pd.DataFrame(R, index=cols, columns=cols), new, short
+
+
+def test_recent() -> bool:
+    """Bekende factoren: geven geschatte ladingen voor aandelen met korte historiek betere correlaties dan
+    de gemiddelde aanname (gemiddelde rij x 0,8)?"""
+    rng = np.random.default_rng(3)
+    T, N, k = 250, 200, 3
+    Bt = rng.normal(0, 0.35, (N + 6, k))
+    Bt[:, 0] = np.abs(Bt[:, 0]) + 0.3                           # marktfactor
+    Bt *= np.sqrt(rng.uniform(0.2, 0.7, N + 6) / (Bt ** 2).sum(1))[:, None]
+    f = rng.normal(0, 1, (T, k))
+    e = rng.normal(0, 1, (T, N + 6)) * np.sqrt(1 - (Bt ** 2).sum(1))
+    Y = f @ Bt.T + e
+    true = Bt @ Bt.T
+    np.fill_diagonal(true, 1.0)
+    W = pd.DataFrame(Y[:, :N], columns=[f"A{i}" for i in range(N)])
+    lens = [20, 40, 80, 120, 160, 240]
+    raw = pd.DataFrame({f"N{j}": np.r_[np.full(T - L, np.nan), Y[T - L:, N + j]] for j, L in enumerate(lens)})
+    R, new, short = corr_factor_extended(W, raw, 10)
+    ok_all = True
+    print("Test correlaties recente beursgangen (3 echte factoren, 200 aandelen met volledige historiek):")
+    A = R.loc[W.columns, W.columns].to_numpy()
+    avg = (A.sum(1) - 1) / (N - 1)
+    for j, L in enumerate(lens):
+        c = f"N{j}"
+        n_obs = L
+        err_imp = np.abs(avg * 0.8 - true[:N, N + j]).mean()
+        if c in short:
+            print(f"  {n_obs:>3} waarnemingen: te kort, blijft aanname (fout aanname {err_imp:.3f})")
+            ok_all &= n_obs < RECENT_MIN_OBS
+            continue
+        err_est = np.abs(R.loc[W.columns, c].to_numpy() - true[:N, N + j]).mean()
+        good = err_est < err_imp or n_obs < 60
+        ok_all &= good if n_obs >= 60 else True
+        print(f"  {n_obs:>3} waarnemingen: fout schatting {err_est:.3f} tegenover aanname {err_imp:.3f}  "
+              f"{'OK' if good else 'FOUT'}")
+    ev = np.linalg.eigvalsh(R.to_numpy()).min()
+    ok_all &= ev > -1e-8
+    print(f"  matrix geldig (kleinste eigenwaarde {ev:.4f})  {'OK' if ev > -1e-8 else 'FOUT'}")
+    print(f"Zelftest recente beursgangen: {'GESLAAGD' if ok_all else 'MISLUKT'}")
+    return ok_all
+
+
 def corr_resid(X: np.ndarray, n_remove: int = 1) -> np.ndarray:
     """Correlaties NA het verwijderen van de marktfactor (eerste hoofdcomponent): wat aandelen gemeen hebben
     bovenop 'alles beweegt met de markt'. Daarop clusteren we de thema's."""
@@ -336,7 +421,9 @@ def self_test() -> bool:
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "test":
-        sys.exit(0 if self_test() else 1)
+        sys.exit(0 if (self_test() and test_recent()) else 1)
+    if len(sys.argv) > 1 and sys.argv[1] == "test_recent":
+        sys.exit(0 if test_recent() else 1)
     quick = "--snel" in sys.argv and (RISK / "themas_stabiliteit.csv").exists() and (RISK / "corr_keuze.txt").exists()
     log("Rendementen laden, tweedaagse rendementen maken ...")
     lr = load_returns()
