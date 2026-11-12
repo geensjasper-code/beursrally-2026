@@ -34,7 +34,7 @@ from risk_corr import (WINDOW, cluster, corr_factor, corr_factor_extended, corr_
 from risk_iv import atm_iv, fx_adjustment, iv_term
 
 LAMBDA_DEFAULT = 0.7
-COMBO_H = [1, 3, 5, 10]          # hier: gemiddelde van HAR en boost_alleen (beste in de vergelijking)
+COMBO_H = [1, 3, 5, 10, 20, 48]  # gemiddelde HAR + boost_alleen; 20/48 toegevoegd na de controleperiode 2022-2025
 LAMBDA_VERSIONS = [0.0, 0.3, 0.5, 0.7, 1.0]
 LOG_DIR = RISK / "log"
 
