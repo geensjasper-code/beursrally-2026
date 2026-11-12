@@ -48,7 +48,7 @@ targets. Decide **before** seeing the model's result, and write down the reason.
 ### Friday 13 November, after 22:30 CET (after the US close)
 
 ```powershell
-python data.py update
+python br.py data update
 ```
 
 Fetch prices and **options** on a trading day: on weekends option quotes are often empty, and the risk model for
@@ -57,13 +57,13 @@ US stocks then falls back to its base version without options.
 ### Sunday 15 November (evening)
 
 ```powershell
-python clean.py
-python features.py
-python risk_har.py
-python risk_boost.py --alleen
-python risk_build.py
-python ret_build.py
-python scen_build.py
+python br.py clean
+python br.py features
+python br.py risk_har
+python br.py risk_boost --alleen
+python br.py risk_build
+python br.py ret_build
+python br.py scen_build
 ```
 
 Check: `risk_build.py` reports "Opties van <date>: ... van 150 aandelen door de kwaliteitsfilter" (options from
@@ -71,7 +71,7 @@ Check: `risk_build.py` reports "Opties van <date>: ... van 150 aandelen door de 
 
 ```powershell
 $env:BR_WORKERS = "20"
-python strategy.py --kandidaten alle --uitsluiten "Bpost,Sif Holding,Avantium,Alstom"
+python br.py strategy --kandidaten alle --uitsluiten "Bpost,Sif Holding,Avantium,Alstom"
 ```
 
 Takes about 40–60 minutes. Output: `data/strategy/orders_start_eigen_uitsluiting_kalle.csv`.
@@ -99,7 +99,7 @@ Then:
 ## Once: Finance Avenue
 
 - **Register and attend on 28 November** → €500, credited on 4 December.
-- Not registered? Then use `python week.py ... --geen-fa`.
+- Not registered? Then use `python br.py week ... --geen-fa`.
 
 ---
 
@@ -108,14 +108,14 @@ Then:
 ### 1. Update the data
 
 ```powershell
-python data.py update
-python clean.py
-python features.py
-python risk_har.py
-python risk_boost.py --alleen
-python risk_build.py
-python ret_build.py
-python scen_build.py
+python br.py data update
+python br.py clean
+python br.py features
+python br.py risk_har
+python br.py risk_boost --alleen
+python br.py risk_build
+python br.py ret_build
+python br.py scen_build
 ```
 
 `scen_build.py` automatically starts the futures on the next trading day and runs them to 22 January.
@@ -125,7 +125,7 @@ Run `data.py update` on Friday evening (options, see above). If it has to be on 
 ### 2. Read in the standings (~7 minutes, no typing)
 
 ```powershell
-python stand_inlezen.py
+python br.py stand_inlezen
 ```
 
 On the Beursrally website, press **Ctrl+A, Ctrl+C** on each page (any order):
@@ -154,7 +154,7 @@ Points of attention at the start (if they are in the portfolio):
 ### 4. The decision
 
 ```powershell
-python week.py --uitsluiten "Bpost,Sif Holding,Avantium,Alstom"
+python br.py week --uitsluiten "Bpost,Sif Holding,Avantium,Alstom"
 ```
 
 Output: **"NIETS DOEN deze week"** (do nothing this week), or the orders for Monday (also saved in
@@ -183,28 +183,43 @@ Sells are executed before buys.
 
 ---
 
-## Files
+## Project layout
 
-| Step | Script | Output |
+```
+br.py                 one entry point: python br.py <command> [options]   (python br.py = list of commands)
+config/               universe.csv (all Beursrally securities), artefacten.csv (known data errors)
+beursrally/
+  paths.py            project folders (data/, config/)
+  data/               1. data.py, clean.py, features.py, check_data.py, fake_yf.py (fake data for tests)
+  risk/               2. risk_common, risk_simple, risk_garch, risk_earn, risk_har, risk_boost, risk_iv,
+                         risk_corr, risk_compare, risk_build, risk_forward
+  returns/            3. ret_models, ret_compare, ret_build
+  scenarios/          4. scen_core, scen_build, scen_backtest
+  game/               5. game.py (game rules), field.py (simulated competitors)
+  strategy/           6. strategy.py, vergelijk_velden.py, rules.py, rollout.py
+  weekly/             stand_inlezen.py, week.py
+  tests/              risk_test.py, ret_test.py (leakage tests)
+docs/                 paper; notes/ = step notes (data, risk, returns) and the original design notes (PDF, Dutch)
+data/                 not in git: Yahoo prices, forecasts, standings (other players' names)
+```
+
+| Step | Command | Output |
 |---|---|---|
-| Universe | `universe.csv` (all Beursrally securities), `artefacten.csv` (known data errors) | |
-| Prices, options, earnings | `data.py`, `clean.py`, `check_data.py` (readable check per stock) | `data/raw`, `data/processed`, `data/meta` |
-| Features | `features.py` | `data/features` |
-| Risk (volatility) | `risk_simple.py`, `risk_garch.py`, `risk_earn.py`, `risk_har.py`, `risk_boost.py`, `risk_iv.py` | forecasts per model |
-| Risk (co-movement) | `risk_corr.py` | correlation models |
-| Risk: selection and today | `risk_compare.py` (selection/check/final test), `risk_build.py` | `data/risk/vol_vandaag`, `corr_vandaag` |
-| Risk: forward test | `risk_forward.py` (optional, weekly: does the option blend lambda really work?) | on the logs of `risk_build.py` |
-| Returns | `ret_models.py`, `ret_compare.py` (selection; `--alles`: w and b), `ret_build.py` | `data/returns/rendement_vandaag` |
-| Scenarios | `scen_core.py`, `scen_build.py`, `scen_backtest.py` (choose and test the shape) | `data/scenarios/params_vandaag.npz` |
-| Game | `game.py` (game rules), `field.py` (competitors) | |
-| Starting portfolio | `strategy.py` | `data/strategy/orders_start*.csv` |
-| Comparison per field type | `vergelijk_velden.py` | (screen) |
-| Trading rules during the competition | `rules.py` (fixed rules, no gain), `rollout.py` (the chosen rollout) | `data/strategy` |
-| Reading in the standings | `stand_inlezen.py` | `data/stand/<date>/` |
-| Weekly decision | `week.py` | `data/stand/<date>/orders_maandag.csv` |
-| Tests | `risk_test.py`, `ret_test.py` (incl. leakage tests), `fake_yf.py` (fake data, `--synthetic`) | |
-
-`data/` is not in git (`.gitignore`): Yahoo prices, and standings containing other players' names.
+| Prices, options, earnings | `data`, `clean`, `check_data` (readable check per stock) | `data/raw`, `data/processed`, `data/meta` |
+| Features | `features` (`features test` = leakage test) | `data/features` |
+| Risk (volatility) | `risk_simple`, `risk_garch`, `risk_earn`, `risk_har`, `risk_boost`, `risk_iv` | forecasts per model |
+| Risk (co-movement) | `risk_corr` | correlation models |
+| Risk: selection and today | `risk_compare` (selection/check/final test), `risk_build` | `data/risk/vol_vandaag`, `corr_vandaag` |
+| Risk: forward test | `risk_forward` (optional, weekly: does the option blend lambda really work?) | on the logs of `risk_build` |
+| Returns | `ret_models`, `ret_compare` (selection; `--alles`: w and b), `ret_build` | `data/returns/rendement_vandaag` |
+| Scenarios | `scen_core` (`test`), `scen_build`, `scen_backtest` (choose and test the shape) | `data/scenarios/params_vandaag.npz` |
+| Game | `game` (`test`, `demo`), `field` (`test`) | |
+| Starting portfolio | `strategy` | `data/strategy/orders_start*.csv` |
+| Comparison per field type | `vergelijk_velden` | (screen) |
+| Trading rules during the competition | `rules` (fixed rules, no gain), `rollout` (the chosen rollout) | `data/strategy` |
+| Reading in the standings | `stand_inlezen` | `data/stand/<date>/` |
+| Weekly decision | `week` | `data/stand/<date>/orders_maandag.csv` |
+| Tests | `risk_test`, `ret_test`; `data ... --synthetic` runs on fake data | |
 
 ## Validation (summary)
 
@@ -222,10 +237,10 @@ final test mid 2025 – November 2026 (looked at once).
 - **`data.py update` fails:** internet? Try again later; Yahoo is sometimes slow. An interrupted run resumes
   automatically.
 - **"niet in onze data"** (not in our data) for a competitor: that position is held constant (not an error).
-  For your own portfolio: add the security to `universe.csv`, then `python data.py resolve` and rerun the pipeline.
+  For your own portfolio: add the security to `config/universe.csv`, then `python br.py data resolve` and rerun the pipeline.
 - **The clipboard script doesn't work:** paste everything into one text file and run
-  `python stand_inlezen.py --bestand stand.txt`.
-- **Reprocess a set of standings:** `python stand_inlezen.py --opnieuw 2026-11-20`.
+  `python br.py stand_inlezen --bestand stand.txt`.
+- **Reprocess a set of standings:** `python br.py stand_inlezen --opnieuw 2026-11-20`.
 
 ---
 
